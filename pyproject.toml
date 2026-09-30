@@ -1,0 +1,62 @@
+[project]
+name = "molecular_qm_search"
+version = "0.1.0"
+description = "Simstack nodes to search for minima and transition states"
+readme = "README.md"
+requires-python = ">=3.12, <3.13"
+license = { text = "MIT" }
+authors = [
+  { name = "Wolfgang Wenzel", email = "wolfgang.wenzel@kit.edu" }
+]
+dependencies = [
+    "molecular_qm_models",
+    "molecular_qm_util",
+    "molecular_qm_dftb",
+    "molecular_qm_psi4",
+    "simstack",
+]
+
+[project.entry-points."simstack.modules"]
+molecular_qm_search = "molecular_qm_search"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["molecular_qm_search"]
+
+[tool.uv.sources]
+molecular_qm_models = { git = "https://github.com/simstack/molecular_qm_models.git" }
+molecular_qm_util = { git = "https://github.com/simstack/molecular_qm_util.git" }
+molecular_qm_dftb = { git = "https://github.com/simstack/molecular_qm_dftb.git" }
+molecular_qm_psi4 = { git = "https://github.com/simstack/molecular_qm_psi4.git" }
+simstack = { git = "https://github.com/simstack/simstack.git", rev = "fix-node-submission-logic" }
+
+[tool.uv]
+package = true
+override-dependencies = [
+    "molecular_qm_models @ git+https://github.com/simstack/molecular_qm_models.git",
+    "molecular_qm_util @ git+https://github.com/simstack/molecular_qm_util.git",
+    "molecular_qm_dftb @ git+https://github.com/simstack/molecular_qm_dftb.git",
+    "molecular_qm_psi4 @ git+https://github.com/simstack/molecular_qm_psi4.git",
+    "simstack @ git+https://github.com/simstack/simstack.git@fix-node-submission-logic",
+    "numpy<2.5.0",
+]
+constraint-dependencies = [
+    "numpy<2.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.1",
+    "pytest-asyncio>=1.3.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
