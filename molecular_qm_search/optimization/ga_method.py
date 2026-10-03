@@ -11,7 +11,7 @@ from molecular_qm_models.internal_coordinates import InternalCoordinateBondType
 from simstack.core.node_runner import NodeRunner
 
 from .ga_population import PopulationGenerator
-from .ga_evaluation import MoleculeEvaluator, make_evaluator, validate_results
+from molecular_qm_search.optimization.lib.ga_evaluation import MoleculeEvaluator, make_evaluator, validate_results
 
 from molecular_qm_search.optimization.lib.ga_smart_optimizer import SmartOptimizer
 

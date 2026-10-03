@@ -3,8 +3,8 @@ import asyncio
 from simstack.core.node import node
 from simstack.core.simstack_result import SimstackResult
 
-from .ga_models import GAConfig
-from .ga_evaluation import make_evaluator
+from molecular_qm_search.optimization.models.ga_models import GAConfig
+from molecular_qm_search.optimization.lib.ga_evaluation import make_evaluator
 from .ga_method import (
     generate_ga_conformers,
     generate_ga_min_conformers,

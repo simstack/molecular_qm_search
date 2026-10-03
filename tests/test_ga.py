@@ -8,7 +8,7 @@ from molecular_qm_models import Atom, Molecule, InternalCoordinatesList, Interna
 from molecular_qm_models.internal_coordinates import InternalCoordinateBondType
 from molecular_qm_search.optimization.ga_population import PopulationGenerator
 from molecular_qm_search.optimization.ga_method import StandardGA, MinimizingGA, DiversityGA
-from molecular_qm_search.optimization.ga_evaluation import validate_results
+from molecular_qm_search.optimization.lib.ga_evaluation import validate_results
 
 
 @pytest.fixture

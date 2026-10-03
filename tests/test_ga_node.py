@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from molecular_qm_models import Molecule, MoleculeList
-from molecular_qm_search.optimization.ga_models import GAConfig
+from molecular_qm_search.optimization.models.ga_models import GAConfig
 
 
 @pytest.mark.asyncio

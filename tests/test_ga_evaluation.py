@@ -7,10 +7,10 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from molecular_qm_models import Atom, Molecule
-from molecular_qm_search.optimization.ga_evaluation import (
+from molecular_qm_search.optimization.lib.ga_evaluation import (
     CallableEvaluator, DFTBEvaluator, XTBEvaluator, RDKitEvaluator, make_evaluator, validate_results,
 )
-from molecular_qm_search.optimization.ga_models import GAOptimizationMethod
+from molecular_qm_search.optimization.models.ga_models import GAOptimizationMethod
 
 
 @pytest.fixture
