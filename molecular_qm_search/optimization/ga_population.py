@@ -11,15 +11,24 @@ from molecular_qm_models.internal_coordinates import InternalCoordinateBondType
 class PopulationGenerator:
     def __init__(self, molecule: Molecule, *, coordinates=None, seed=1,
                  mutation_rate=0.2, crossover_rate=0.5, dihedral_interval=30.0,
-                 db_treatment="180+step"):
+                 db_treatment="180+step", match_double_bonds=True,
+                 rotatable_bond_min=-180.0, rotatable_bond_max=180.0):
         if db_treatment not in {"ignore", "180+step", "treat-as-single"}:
             raise ValueError(f"Unknown double-bond treatment: {db_treatment}")
+        if rotatable_bond_max <= rotatable_bond_min:
+            raise ValueError(
+                f"rotatable_bond_max ({rotatable_bond_max}) must be greater than "
+                f"rotatable_bond_min ({rotatable_bond_min})"
+            )
         self.molecule = self._copy_molecule(molecule)
         if coordinates is None:
             from molecular_qm_util import get_rotatable_bonds
 
             coordinates = get_rotatable_bonds(
-                molecule, match_double_bonds=db_treatment != "ignore"
+                molecule,
+                match_double_bonds=match_double_bonds,
+                min_value=rotatable_bond_min,
+                max_value=rotatable_bond_max,
             )
         self.coordinates = copy.deepcopy(coordinates)
         if db_treatment == "ignore":

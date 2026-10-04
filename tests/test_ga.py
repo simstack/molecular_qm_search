@@ -50,6 +50,34 @@ class Evaluator:
         return results
 
 
+def test_rotatable_bond_discovery_receives_its_options(molecule, monkeypatch):
+    captured = {}
+
+    def fake_get_rotatable_bonds(mol, match_double_bonds=False, min_value=-180.0, max_value=180.0):
+        captured["molecule"] = mol
+        captured["match_double_bonds"] = match_double_bonds
+        captured["min_value"] = min_value
+        captured["max_value"] = max_value
+        return InternalCoordinatesList()
+
+    import molecular_qm_util
+    monkeypatch.setattr(
+        molecular_qm_util, "get_rotatable_bonds", fake_get_rotatable_bonds, raising=False,
+    )
+    PopulationGenerator(
+        molecule, match_double_bonds=False, rotatable_bond_min=-90, rotatable_bond_max=120,
+    )
+    assert captured["molecule"] is molecule
+    assert captured["match_double_bonds"] is False
+    assert captured["min_value"] == -90
+    assert captured["max_value"] == 120
+
+
+def test_inverted_rotatable_bond_bounds_are_rejected(molecule, coordinates):
+    with pytest.raises(ValueError, match="rotatable_bond_max"):
+        PopulationGenerator(molecule, coordinates=coordinates, rotatable_bond_min=10, rotatable_bond_max=10)
+
+
 def test_generation_is_reproducible_and_does_not_modify_inputs(molecule, coordinates):
     original_molecule, original_coordinates = copy.deepcopy((molecule, coordinates))
     state = random.getstate()
@@ -150,7 +178,7 @@ def test_real_rdkit_ga_smoke(ga_class, tmp_path, monkeypatch):
 
     monkeypatch.chdir(tmp_path)
     ga = ga_class(smiles_to_molecule("CCCC"), logging.getLogger("test"),
-                  pop_size=3, num_confs=2, generations=0, threads=1, max_iters=100)
+                  pop_size=3, num_confs=2, generations=0, parallel_children=1, max_iters=100)
     result = list(ga.run())
     assert result
     rescored = score_molecules_rdkit(result, threads=1)

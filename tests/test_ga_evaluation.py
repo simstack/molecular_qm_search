@@ -93,14 +93,28 @@ def test_dftb_failures_are_not_silently_scored(dftb_stub, molecule, failure):
         DFTBEvaluator().optimize([molecule], max_iters=5)
 
 
-def test_factory_explicit_method_overrides_legacy_forcefield():
-    evaluator = make_evaluator(GAOptimizationMethod.RDKIT_UFF, forcefield="mmff")
+@pytest.mark.parametrize("method,forcefield", [
+    (GAOptimizationMethod.RDKIT_MMFF, "mmff94"),
+    (GAOptimizationMethod.RDKIT_MMFF94S, "mmff94s"),
+    (GAOptimizationMethod.RDKIT_UFF, "uff"),
+    ("RDKIT/uff", "uff"),
+])
+def test_factory_maps_rdkit_methods(method, forcefield):
+    evaluator = make_evaluator(method, parallel_children=2)
     assert isinstance(evaluator, RDKitEvaluator)
-    assert evaluator.forcefield == "rdkit_uff"
-    assert isinstance(make_evaluator("dftb"), DFTBEvaluator)
-    assert isinstance(make_evaluator("xtb"), XTBEvaluator)
+    assert evaluator.forcefield == forcefield
+    assert evaluator.threads == 2
+
+
+def test_factory_selects_quantum_methods_and_rejects_unknown_ones():
+    assert isinstance(make_evaluator(GAOptimizationMethod.DFTB), DFTBEvaluator)
+    assert isinstance(make_evaluator("XTB"), XTBEvaluator)
     with pytest.raises(ValueError, match="Unsupported GA"):
         make_evaluator("orca")
+    with pytest.raises(ValueError, match="Unsupported GA"):
+        make_evaluator(None)
+    with pytest.raises(ValueError, match="parallel_children"):
+        make_evaluator(GAOptimizationMethod.RDKIT_MMFF, parallel_children=-1)
 
 
 def test_external_batch_adapter(molecule):
@@ -155,7 +169,7 @@ def xtb_stub(monkeypatch):
     return calls, calculator_module
 
 
-@pytest.mark.parametrize("method", ["xtb", GAOptimizationMethod.XTB])
+@pytest.mark.parametrize("method", ["XTB", GAOptimizationMethod.XTB])
 def test_xtb_batch_dispatch_units_options_and_input_isolation(xtb_stub, molecule, method):
     calls, _ = xtb_stub
     evaluator = make_evaluator(

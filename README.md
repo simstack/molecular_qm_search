@@ -9,7 +9,8 @@ The conformer GA operates on `Molecule`, `MoleculeList`, and
 
 `optimization.ga_population.PopulationGenerator` discovers torsions through
 `molecular_qm_util.get_rotatable_bonds`, or accepts an explicit
-`InternalCoordinatesList`. Its `generate`, `reproduce`,
+`InternalCoordinatesList`. Discovery receives `match_double_bonds`,
+`rotatable_bond_min`, and `rotatable_bond_max`. `generate`, `reproduce`,
 `molecule_from_coordinates`, and `coordinates_from_molecule` methods never
 score or optimize a structure. Passing coordinates avoids RDKit torsion discovery.
 Each generator owns its seeded random state; mutation does not modify parents.
@@ -51,7 +52,7 @@ from molecular_qm_search.optimization.ga_method import StandardGA
 ga = StandardGA(
     initial_mol=molecule,
     node_runner=node_runner,
-    optimization_method="xtb",
+    optimization_method="XTB",
     backend_options={"level_of_theory": {"method": "gfn2", "charge": 0}},
     pop_size=20,
     generations=10,
@@ -59,10 +60,10 @@ ga = StandardGA(
 conformers = ga.run()
 ```
 
-Use `optimization_method="dftb"` with DFTB options, or `"rdkit_uff"`,
-`"rdkit_mmff94"`, or `"rdkit_mmff94s"`. If omitted, the legacy `forcefield`
-argument still selects the RDKit force field. A supplied `evaluator` takes
-precedence. Unsupported methods raise instead of falling back to UFF.
+`optimization_method` is `GAOptimizationMethod`: `RDKIT/mmff` (MMFF94),
+`RDKIT/mmff94s`, `RDKIT/uff`, `XTB`, or `DFTB`. `parallel_children` is the
+number of evaluations to run together. A supplied `evaluator` takes
+precedence. Unsupported methods raise.
 
 `run_ga_conformer_gen(GAConfig(...))` provides the SimStack node entry point and
 returns a `MoleculeList` as `node_runner.result`. It runs the synchronous GA in a

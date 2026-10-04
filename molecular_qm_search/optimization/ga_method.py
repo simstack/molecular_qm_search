@@ -1,6 +1,5 @@
 from __future__ import annotations
 import numpy as np
-import os
 import time
 import pickle
 from typing import List, Tuple, Dict, Optional, Union
@@ -12,8 +11,8 @@ from simstack.core.node_runner import NodeRunner
 
 from .ga_population import PopulationGenerator
 from molecular_qm_search.optimization.lib.ga_evaluation import MoleculeEvaluator, make_evaluator, validate_results
-
 from molecular_qm_search.optimization.lib.ga_smart_optimizer import SmartOptimizer
+from molecular_qm_search.optimization.models.ga_models import GAOptimizationMethod
 
 
 def plot_conformer_diversity(conformers: MoleculeList, output_prefix: str = "") -> None:
@@ -41,16 +40,18 @@ class BaseGA:
             crossover_rate: float = 0.5,
             dihedral_interval: float = 30.0,
             seed: int = 1,
-            forcefield: str = "mmff",
             max_iters: int = 500,
-            threads: int = 0,
+            parallel_children: int = 0,
             profile: bool = False,
             smart_opt: bool = False,
             restart: bool = False,
             db_treatment: str = "180+step",
+            match_double_bonds: bool = True,
+            rotatable_bond_min: float = -180.0,
+            rotatable_bond_max: float = 180.0,
             evaluator: Optional[MoleculeEvaluator] = None,
             coordinates: Optional[InternalCoordinatesList] = None,
-            optimization_method=None,
+            optimization_method: GAOptimizationMethod = GAOptimizationMethod.RDKIT_MMFF,
             backend_options=None,
     ):
         self.num_confs = num_confs
@@ -60,9 +61,8 @@ class BaseGA:
         self.crossover_rate = crossover_rate
         self.dihedral_interval = dihedral_interval
         self.seed = seed
-        self.forcefield = forcefield
         self.max_iters = max_iters
-        self.threads = threads
+        self.parallel_children = parallel_children
         self.profile = profile
         self.smart_opt = smart_opt
         self.restart = restart
@@ -77,8 +77,10 @@ class BaseGA:
         self.dihedrals: List[Tuple[int, int, int, int]] = []
         self.dihedral_types: List[str] = []  # 'SB' (single bond) or 'DB' (double bond)
         self.db_treatment = db_treatment
+        self.match_double_bonds = match_double_bonds
+        self.rotatable_bond_min = rotatable_bond_min
+        self.rotatable_bond_max = rotatable_bond_max
         self.timing: Dict[str, float] = {}
-        self.num_workers = threads if threads > 0 else max(1, os.cpu_count() // 2 if os.cpu_count() else 1)
         self.success_stats = {"mutation": [0, 0], "crossover": [0, 0], "copy": [0, 0], "initial": [0, 0],
                               "ga-select": [0, 0]}
 
@@ -86,10 +88,15 @@ class BaseGA:
             raise ValueError("Population and conformer counts must be positive; generations cannot be negative")
         if not 0 <= mutation_rate <= 1 or not 0 <= crossover_rate <= 1:
             raise ValueError("Mutation and crossover rates must lie in [0, 1]")
-        if max_iters < 0 or threads < 0 or dihedral_interval < 0:
-            raise ValueError("Iteration, thread, and dihedral-step values cannot be negative")
+        if max_iters < 0 or parallel_children < 0 or dihedral_interval < 0:
+            raise ValueError("Iteration, parallel children, and dihedral-step values cannot be negative")
+        if rotatable_bond_max <= rotatable_bond_min:
+            raise ValueError(
+                f"rotatable_bond_max ({rotatable_bond_max}) must be greater than "
+                f"rotatable_bond_min ({rotatable_bond_min})"
+            )
         self.evaluator = evaluator if evaluator is not None else make_evaluator(
-            optimization_method, forcefield=forcefield, threads=threads,
+            optimization_method, parallel_children=parallel_children,
             backend_options=backend_options,
         )
         self.input_coordinates = coordinates
@@ -159,6 +166,9 @@ class BaseGA:
             self.initial_mol, coordinates=self.input_coordinates, seed=self.seed,
             mutation_rate=self.mutation_rate, crossover_rate=self.crossover_rate,
             dihedral_interval=self.dihedral_interval, db_treatment=self.db_treatment,
+            match_double_bonds=self.match_double_bonds,
+            rotatable_bond_min=self.rotatable_bond_min,
+            rotatable_bond_max=self.rotatable_bond_max,
         )
         self.template_coords = self.population_generator.coordinates
         self.dihedrals = [tuple(c.atom_indices) for c in self.template_coords.elements]
@@ -203,7 +213,11 @@ class BaseGA:
         self.node_runner.info(f"Crossover Rate: {self.crossover_rate}")
         self.node_runner.info(f"Dihedral Step:  {self.dihedral_interval}")
         self.node_runner.info(f"Evaluator:      {type(self.evaluator).__name__} (Max Iters: {self.max_iters})")
-        self.node_runner.info(f"Threads:        {self.num_workers}")
+        self.node_runner.info(f"Parallel children: {self.parallel_children}")
+        self.node_runner.info(f"Match double bonds: {self.match_double_bonds}")
+        self.node_runner.info(
+            f"Rotatable bond range: {self.rotatable_bond_min} .. {self.rotatable_bond_max}"
+        )
         self.node_runner.info(f"Seed:           {self.seed}")
         self.node_runner.info(f"Smart Opt:      {self.smart_opt}")
         self.node_runner.info(f"Restart:        {self.restart}")

@@ -36,8 +36,9 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
     evaluator = kwargs.pop("evaluator", None)
     if evaluator is None:
         evaluator = make_evaluator(
-            config.optimization_method, forcefield=config.forcefield,
-            threads=config.threads, backend_options=config.backend_options,
+            config.optimization_method,
+            parallel_children=config.parallel_children,
+            backend_options=config.backend_options,
             loop=asyncio.get_running_loop(), node_kwargs=kwargs,
         )
 
@@ -56,13 +57,15 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
         crossover_rate=config.crossover_rate,
         dihedral_interval=config.dihedral_interval,
         seed=config.seed,
-        forcefield=config.forcefield,
         max_iters=config.max_iters,
-        threads=config.threads,
+        parallel_children=config.parallel_children,
         smart_opt=config.smart_opt,
         node_runner=node_runner,
         evaluator=evaluator,
         db_treatment=config.db_treatment,
+        match_double_bonds=config.match_double_bonds,
+        rotatable_bond_min=config.rotatable_bond_min,
+        rotatable_bond_max=config.rotatable_bond_max,
         **extra_args,
     )
 

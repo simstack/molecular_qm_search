@@ -9,6 +9,8 @@ from typing import Callable, Protocol
 from molecular_qm_models import Molecule, MoleculeList
 from pydantic import BaseModel, Field
 
+from molecular_qm_search.optimization.models.ga_models import GAOptimizationMethod
+
 
 class MoleculeEvaluator(Protocol):
     """Return one new molecule per input, in input order and atom order.
@@ -189,13 +191,22 @@ class XTBEvaluator(NodeMoleculeEvaluator):
         return validate_results(molecules, results)
 
 
-def make_evaluator(method=None, *, forcefield="mmff", threads=0,
+def make_evaluator(method, *, parallel_children=0,
                    backend_options=None, loop=None, node_kwargs=None) -> MoleculeEvaluator:
-    method = getattr(method, "value", method)
-    if method is None or method in {"rdkit_uff", "rdkit_mmff94", "rdkit_mmff94s"}:
-        return RDKitEvaluator(forcefield=method or forcefield, threads=threads)
-    if method == "dftb":
+    if parallel_children < 0:
+        raise ValueError("parallel_children cannot be negative")
+    if isinstance(method, GAOptimizationMethod):
+        method = method.value
+    if method == GAOptimizationMethod.RDKIT_MMFF:
+        forcefield = "mmff94"
+    elif method == GAOptimizationMethod.RDKIT_MMFF94S:
+        forcefield = "mmff94s"
+    elif method == GAOptimizationMethod.RDKIT_UFF:
+        forcefield = "uff"
+    elif method == GAOptimizationMethod.DFTB:
         return DFTBEvaluator(backend_options, loop=loop, node_kwargs=node_kwargs)
-    if method == "xtb":
+    elif method == GAOptimizationMethod.XTB:
         return XTBEvaluator(backend_options, loop=loop, node_kwargs=node_kwargs)
-    raise ValueError(f"Unsupported GA evaluation method: {method!r}")
+    else:
+        raise ValueError(f"Unsupported GA evaluation method: {method!r}")
+    return RDKitEvaluator(forcefield=forcefield, threads=parallel_children)
