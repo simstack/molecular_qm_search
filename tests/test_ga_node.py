@@ -1,12 +1,21 @@
 import asyncio
 import importlib
+import inspect
 from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
+from simstack.tables import node_children
+from simstack.util.docstring_parser import DocstringParser
 
 from molecular_qm_models import Molecule, MoleculeList
 from molecular_qm_search.optimization.models.ga_models import GAConfig, GAOptimizationMethod
+
+CALCULATOR_NODES = {
+    "dftb_calculator": "molecular_qm_dftb.nodes.dftb_calculator.dftb_calculator",
+    "xtb_molecule_list": "molecular_qm_psi4.nodes.crest.xtb_molecule_list",
+    "xtb_optimize_molecule_list": "molecular_qm_psi4.nodes.crest.xtb_optimize_molecule_list",
+}
 
 
 @pytest.mark.asyncio
@@ -79,3 +88,50 @@ async def test_node_rejects_unknown_mode():
         await module.run_ga_conformer_gen.__wrapped__(
             config, node_runner=SimpleNamespace(info=lambda *a: None),
         )
+
+
+@pytest.mark.asyncio
+async def test_node_exposes_calculator_children_as_called_nodes(tmp_path, monkeypatch):
+    module = importlib.import_module("molecular_qm_search.optimization.ga")
+    parsed = DocstringParser(inspect.getdoc(module.run_ga_conformer_gen)).called_nodes()
+    assert parsed == list(CALCULATOR_NODES)
+
+    models = [
+        SimpleNamespace(
+            id=name, name=name, function_mapping=mapping,
+            description="", called_nodes=[],
+        )
+        for name, mapping in CALCULATOR_NODES.items()
+    ]
+    parent = SimpleNamespace(
+        id="ga",
+        name="run_ga_conformer_gen",
+        function_mapping="molecular_qm_search.optimization.ga.run_ga_conformer_gen",
+        description="",
+        called_nodes=[],
+    )
+    models.append(parent)
+    updates = []
+
+    class FakeCollection:
+        async def update_one(self, query, update):
+            updates.append((query, update))
+
+    class FakeDatabase:
+        async def find(self, model):
+            return models
+
+        def get_collection(self, model):
+            return FakeCollection()
+
+    async def import_function(function_mapping, database):
+        if function_mapping == parent.function_mapping:
+            return module.run_ga_conformer_gen
+        return lambda: None
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(node_children, "import_function", import_function)
+    await node_children.update_node_children(FakeDatabase(), "")
+
+    parent_update = next(update for query, update in updates if query == {"_id": "ga"})
+    assert parent_update == {"$set": {"called_nodes": sorted(CALCULATOR_NODES.values())}}

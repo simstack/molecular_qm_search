@@ -14,6 +14,15 @@ from .ga_method import (
 
 @node
 async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
+    """Generate conformers with a genetic algorithm.
+
+    DFTB and xTB evaluations run as child nodes. RDKit force fields stay in-process.
+
+    Called Nodes:
+        dftb_calculator
+        xtb_molecule_list
+        xtb_optimize_molecule_list
+    """
     node_runner = kwargs.get("node_runner")
 
     # The GA now takes a single simstack Molecule as its only input source.
