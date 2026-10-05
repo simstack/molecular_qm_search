@@ -3,6 +3,8 @@ import asyncio
 from simstack.core.node import node
 from simstack.core.simstack_result import SimstackResult
 
+from molecular_qm_models import MoleculeList
+
 from molecular_qm_search.optimization.models.ga_models import GAConfig
 from molecular_qm_search.optimization.lib.ga_evaluation import make_evaluator
 from .ga_method import (
@@ -22,6 +24,14 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
         dftb_calculator
         xtb_molecule_list
         xtb_optimize_molecule_list
+
+    Raises:
+        ValueError: missing initial molecule, unknown mode, or invalid GA settings
+
+    SimstackResult:
+        molecules (MoleculeList): Ranked conformers produced by the genetic algorithm
+        energy_chart (ChartArtifactModel): Minimum and maximum population energy versus iteration
+        operator_stats (SimpleTable): Elite-survival rate of each population-change type
     """
     node_runner = kwargs.get("node_runner")
 
@@ -29,9 +39,12 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
     if config.initial_molecule is None:
         raise ValueError("GAConfig must provide an initial_molecule.")
 
-    node_runner.info(
+    start_message = (
         f"Starting GA ({config.mode}) conformer generation from the provided initial_molecule."
     )
+    if hasattr(node_runner, "log_string"):
+        node_runner.log(start_message)
+    node_runner.info(start_message)
 
     if config.mode == "ga":
         gen_func = generate_ga_conformers
@@ -78,5 +91,11 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
         **extra_args,
     )
 
-    node_runner.result = ranked
+    if not isinstance(ranked, MoleculeList):
+        raise ValueError(f"GA returned {type(ranked).__name__}, expected a MoleculeList")
+    if getattr(node_runner, "energy_chart", None) is None:
+        raise ValueError("GA did not produce an energy chart")
+    if getattr(node_runner, "operator_stats", None) is None:
+        raise ValueError("GA did not produce operator statistics")
+    node_runner.molecules = ranked
     return node_runner.succeed()

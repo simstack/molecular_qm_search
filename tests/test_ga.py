@@ -159,6 +159,63 @@ def test_backend_missing_results_are_rejected(molecule):
         validate_results([molecule], [])
 
 
+class RecordingRunner:
+    def __init__(self):
+        self.log_string = ""
+        self.info_messages = []
+
+    def info(self, message):
+        self.info_messages.append(message)
+
+    def log(self, message):
+        self.log_string += f"{message}\n"
+
+    def error(self, message):
+        raise AssertionError(message)
+
+
+class DistinctGeometryEvaluator:
+    def score(self, molecules):
+        results = []
+        for index, molecule in enumerate(molecules):
+            result = Molecule.from_molecule(molecule)
+            result.atoms[0].x = float(index) * 2.0
+            result.properties["energy"] = float(index)
+            results.append(result)
+        return results
+
+    def optimize(self, molecules, *, max_iters):
+        return self.score(molecules)
+
+
+def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runner = RecordingRunner()
+    ga = StandardGA(
+        molecule, runner, evaluator=DistinctGeometryEvaluator(), coordinates=coordinates,
+        pop_size=12, num_confs=6, generations=2, mutation_rate=1.0, crossover_rate=0.5, seed=1,
+    )
+    conformers = ga.run()
+    assert len(conformers) > 1
+    assert "Population:     12" in runner.log_string
+    assert "Dihedral Types:" in runner.log_string
+    assert runner.log_string == "\n".join(runner.info_messages) + "\n"
+    chart = runner.energy_chart
+    assert [series.yKey for series in chart.series] == ["min-energy", "max-energy"]
+    assert [series.title for series in chart.series] == ["min-energy", "max-energy"]
+    assert [row["iteration"] for row in chart.data] == [0, 1, 2]
+    assert all("min-energy" in row and "max-energy" in row for row in chart.data)
+    table = runner.operator_stats
+    assert table.heading == ["change", "produced", "elite_survivors", "success_rate"]
+    changes = [row["change"] for row in table.row]
+    assert "initial" in changes
+    assert "crossover" in changes
+    assert any(change.startswith("mutation-") for change in changes)
+    for row in table.row:
+        assert 0 <= row["success_rate"] <= 1
+        assert row["elite_survivors"] <= row["produced"]
+
+
 def test_restart_restores_generator_random_state(molecule, coordinates, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     ga = StandardGA(molecule, logging.getLogger("test"), evaluator=Evaluator(), coordinates=coordinates)

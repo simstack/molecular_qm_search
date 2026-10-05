@@ -114,6 +114,8 @@ class PopulationGenerator:
                             and coord.bond_type == InternalCoordinateBondType.DOUBLE):
                         delta += 180.0
                     self._shift(coord, delta)
-                    origin = "mutation"
+                    if coord.bond_type is None or not hasattr(coord.bond_type, "value"):
+                        raise ValueError(f"Mutated coordinate has no bond type: {coord.bond_type!r}")
+                    origin = f"mutation-{coord.bond_type.value}"
             population.append((child, origin))
         return population

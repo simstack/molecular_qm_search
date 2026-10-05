@@ -8,6 +8,14 @@ from pathlib import Path
 from molecular_qm_models import Molecule, MoleculeList, InternalCoordinatesList, prune_conformers
 from molecular_qm_models.internal_coordinates import InternalCoordinateBondType
 from simstack.core.node_runner import NodeRunner
+from simstack.models.charts_artifact import (
+    AGChartAxisConfig,
+    AGChartLegendConfig,
+    AGChartTitleConfig,
+    AGLineSeriesConfig,
+    ChartArtifactModel,
+)
+from simstack.models.simple_table import SimpleTable, SimpleTableColumnType
 
 from .ga_population import PopulationGenerator
 from molecular_qm_search.optimization.lib.ga_evaluation import MoleculeEvaluator, make_evaluator, validate_results
@@ -81,8 +89,9 @@ class BaseGA:
         self.rotatable_bond_min = rotatable_bond_min
         self.rotatable_bond_max = rotatable_bond_max
         self.timing: Dict[str, float] = {}
-        self.success_stats = {"mutation": [0, 0], "crossover": [0, 0], "copy": [0, 0], "initial": [0, 0],
-                              "ga-select": [0, 0]}
+        self.energy_history: List[Dict[str, float]] = []
+        # [elite survivors, produced] for each population-change label.
+        self.success_stats: Dict[str, List[int]] = {}
 
         if pop_size < 1 or num_confs < 1 or generations < 0:
             raise ValueError("Population and conformer counts must be positive; generations cannot be negative")
@@ -127,6 +136,7 @@ class BaseGA:
             "gen": gen,
             "best_stored": self.best_stored,
             "success_stats": self.success_stats,
+            "energy_history": self.energy_history,
             "best_energy_seen": self.best_energy_seen,
             "random_state": self.population_generator.random.getstate()
         }
@@ -136,7 +146,7 @@ class BaseGA:
 
         with open("ga_state.pkl", "wb") as f:
             pickle.dump(state, f)
-        self.node_runner.info(f"Saved GA state of generation {gen}.")
+        self._report(f"Saved GA state of generation {gen}.")
 
     def load_state(self) -> Optional[Tuple[List[Tuple[InternalCoordinatesList, str]], int]]:
         if not Path("ga_state.pkl").exists():
@@ -146,12 +156,17 @@ class BaseGA:
                 state = pickle.load(f)
             if "random_state" in state:
                 self.population_generator.random.setstate(state["random_state"])
+            if "energy_history" not in state:
+                raise ValueError("GA checkpoint has no energy_history")
+            if "success_stats" not in state:
+                raise ValueError("GA checkpoint has no success_stats")
             self.best_stored = state.get("best_stored", MoleculeList())
-            self.success_stats = state.get("success_stats", self.success_stats)
+            self.success_stats = state["success_stats"]
+            self.energy_history = state["energy_history"]
             self.best_energy_seen = state.get("best_energy_seen", float('inf'))
             if hasattr(self, "rmsd_history") and "rmsd_history" in state:
                 self.rmsd_history = state["rmsd_history"]
-            self.node_runner.info(f"Loaded GA state from generation {state['gen']}.")
+            self._report(f"Loaded GA state from generation {state['gen']}.")
             return state["population"], state["gen"]
         except Exception as e:
             self.node_runner.error(f"Failed to load GA state: {e}")
@@ -203,36 +218,123 @@ class BaseGA:
         diffs = np.where(diffs > 180, 360 - diffs, diffs)
         return float(np.sqrt(np.mean(np.square(diffs))))
 
+    def _report(self, message: str) -> None:
+        """Send a message to the task log and the node runner info log."""
+        if hasattr(self.node_runner, "log_string"):
+            self.node_runner.log(message)
+        self.node_runner.info(message)
+
+    def _count_origin(self, origin: str, *, elite: bool) -> None:
+        counts = self.success_stats.setdefault(origin, [0, 0])
+        counts[1] += 1
+        if elite:
+            counts[0] += 1
+
+    def _record_energy_iteration(self, iteration: int, energies: List[float]) -> None:
+        if not energies:
+            raise ValueError(f"GA iteration {iteration} produced no energies")
+        self.energy_history.append({
+            "iteration": int(iteration),
+            "min_energy": float(min(energies)),
+            "max_energy": float(max(energies)),
+        })
+
+    def _publish_run_report(self) -> None:
+        if not self.energy_history:
+            raise ValueError("GA produced no energy history")
+        data = [
+            {
+                "iteration": int(point["iteration"]),
+                "min-energy": float(point["min_energy"]),
+                "max-energy": float(point["max_energy"]),
+            }
+            for point in self.energy_history
+        ]
+        series = [
+            AGLineSeriesConfig(
+                type="line",
+                xKey="iteration",
+                yKey="min-energy",
+                title="min-energy",
+                data=data,
+                stroke="#4ECDC4",
+            ),
+            AGLineSeriesConfig(
+                type="line",
+                xKey="iteration",
+                yKey="max-energy",
+                title="max-energy",
+                data=data,
+                stroke="#FF6B6B",
+            ),
+        ]
+        self.node_runner.energy_chart = ChartArtifactModel(
+            data=data,
+            title=AGChartTitleConfig(text="Energy vs iteration"),
+            series=series,
+            axes=[
+                AGChartAxisConfig(type="number", position="bottom", title="iteration"),
+                AGChartAxisConfig(type="number", position="left", title="energy"),
+            ],
+            legend=AGChartLegendConfig(enabled=True, position="right"),
+        )
+        table = SimpleTable(name="Population change success rates")
+        table.add_column("change", SimpleTableColumnType.STRING)
+        table.add_column("produced", SimpleTableColumnType.NUMBER)
+        table.add_column("elite_survivors", SimpleTableColumnType.NUMBER)
+        table.add_column("success_rate", SimpleTableColumnType.NUMBER)
+        self._report("\n--- GA Success Rates (Elite Survival) ---")
+        for origin, counts in self.success_stats.items():
+            if len(counts) != 2:
+                raise ValueError(f"Success counts for {origin} are not usable: {counts}")
+            survived, produced = counts
+            if produced == 0 and survived == 0:
+                continue
+            if produced <= 0 or survived < 0 or survived > produced:
+                raise ValueError(f"Success counts for {origin} are not usable: {counts}")
+            rate = survived / produced
+            self._report(f"{origin:<15}: {rate * 100:6.2f}% ({survived}/{produced})")
+            table.add_row({
+                "change": origin,
+                "produced": produced,
+                "elite_survivors": survived,
+                "success_rate": rate,
+            })
+        self.node_runner.operator_stats = table
+
     def run(self) -> MoleculeList:
         self.setup()
-        self.node_runner.info("\n--- GA Parameters ---")
-        self.node_runner.info(f"Atoms:          {len(self.initial_mol.atoms)}")
-        self.node_runner.info(f"Population:     {self.pop_size}")
-        self.node_runner.info(f"Generations:    {self.generations}")
-        self.node_runner.info(f"Mutation Rate:  {self.mutation_rate}")
-        self.node_runner.info(f"Crossover Rate: {self.crossover_rate}")
-        self.node_runner.info(f"Dihedral Step:  {self.dihedral_interval}")
-        self.node_runner.info(f"Evaluator:      {type(self.evaluator).__name__} (Max Iters: {self.max_iters})")
-        self.node_runner.info(f"Parallel children: {self.parallel_children}")
-        self.node_runner.info(f"Match double bonds: {self.match_double_bonds}")
-        self.node_runner.info(
+        self._report("\n--- GA Parameters ---")
+        self._report(f"Atoms:          {len(self.initial_mol.atoms)}")
+        self._report(f"Population:     {self.pop_size}")
+        self._report(f"Generations:    {self.generations}")
+        self._report(f"Mutation Rate:  {self.mutation_rate}")
+        self._report(f"Crossover Rate: {self.crossover_rate}")
+        self._report(f"Dihedral Step:  {self.dihedral_interval}")
+        self._report(f"Evaluator:      {type(self.evaluator).__name__} (Max Iters: {self.max_iters})")
+        self._report(f"Parallel children: {self.parallel_children}")
+        self._report(f"Match double bonds: {self.match_double_bonds}")
+        self._report(
             f"Rotatable bond range: {self.rotatable_bond_min} .. {self.rotatable_bond_max}"
         )
-        self.node_runner.info(f"Seed:           {self.seed}")
-        self.node_runner.info(f"Smart Opt:      {self.smart_opt}")
-        self.node_runner.info(f"Restart:        {self.restart}")
+        self._report(f"Seed:           {self.seed}")
+        self._report(f"Smart Opt:      {self.smart_opt}")
+        self._report(f"Restart:        {self.restart}")
         if hasattr(self, "n_prune"):
-            self.node_runner.info(f"Prune Every:    {getattr(self, 'n_prune')}")
+            self._report(f"Prune Every:    {getattr(self, 'n_prune')}")
         if hasattr(self, "prune_rms_thresh"):
-            self.node_runner.info(f"Prune RMS:      {getattr(self, 'prune_rms_thresh')}")
-        self.node_runner.info(f"Rotatable Bonds: {len(self.template_coords.elements)}")
-        self.node_runner.info(f"Dihedrals:       {self.dihedrals}")
-        self.node_runner.info(f"Dihedral Types:  {self.dihedral_types}")
-        self.node_runner.info("---------------------\n")
+            self._report(f"Prune RMS:      {getattr(self, 'prune_rms_thresh')}")
+        self._report(f"Rotatable Bonds: {len(self.template_coords.elements)}")
+        self._report(f"Dihedrals:       {self.dihedrals}")
+        self._report(f"Dihedral Types:  {self.dihedral_types}")
+        self._report("---------------------\n")
 
         if not self.template_coords.elements:
-            self.node_runner.info("No rotatable bonds found.")
-            return _to_molecule_list(self.evaluate_molecules([self.initial_mol], optimize=True))
+            self._report("No rotatable bonds found.")
+            evaluated = self.evaluate_molecules([self.initial_mol], optimize=True)
+            self._record_energy_iteration(0, [mol.properties["energy"] for mol in evaluated])
+            self._publish_run_report()
+            return _to_molecule_list(evaluated)
 
         start_gen = 0
         population = None
@@ -249,6 +351,11 @@ class BaseGA:
         for gen in range(start_gen, self.generations + 1):
             pop_coords = [ind for ind, _ in population]
             scored_pop = self.evaluate_population(pop_coords)
+            if len(scored_pop) != len(population):
+                raise ValueError(
+                    f"Evaluator returned {len(scored_pop)} energies for {len(population)} individuals"
+                )
+            self._record_energy_iteration(gen, [energy for energy, _ in scored_pop])
             # Re-attach labels
             scored_with_labels = [(scored_pop[i][0], scored_pop[i][1], population[i][1]) for i in
                                   range(len(population))]
@@ -260,7 +367,9 @@ class BaseGA:
                 self.save_state(population, gen)
 
         self.timing["GA Loop"] = time.perf_counter() - t1
-        return self.finalize([ind for ind, _ in population])
+        molecules = self.finalize([ind for ind, _ in population])
+        self._publish_run_report()
+        return molecules
 
     def selection(
             self,
@@ -270,12 +379,9 @@ class BaseGA:
         scored_pop.sort(key=lambda x: x[0])
         # Track survival
         elite_size = max(1, int(self.pop_size * 0.2))
-        for i in range(min(len(scored_pop), elite_size)):
-            origin = scored_pop[i][2]
-            self.success_stats[origin][0] += 1  # Survived to elite
-
-        for _, _, origin in scored_pop:
-            self.success_stats[origin][1] += 1  # Total produced
+        elite_count = min(len(scored_pop), elite_size)
+        for index, (_, _, origin) in enumerate(scored_pop):
+            self._count_origin(origin, elite=index < elite_count)
 
         best_individuals = [(ind, origin) for _, ind, origin in scored_pop[:elite_size]]
         return self.reproduce(best_individuals, self.pop_size)
@@ -295,19 +401,14 @@ class BaseGA:
 
         self.timing["Finalization"] = time.perf_counter() - t2
 
-        self.node_runner.info("\n--- GA Success Rates (Elite Survival) ---")
-        for origin, counts in self.success_stats.items():
-            rate = (counts[0] / counts[1] * 100) if counts[1] > 0 else 0
-            self.node_runner.info(f"{origin:<15}: {rate:6.2f}% ({counts[0]}/{counts[1]})")
-
         self.smart_optimizer.report()
 
         output_prefix = f"{self.__class__.__name__.lower()}_diversity"
         plot_conformer_diversity(final_ranked, output_prefix=output_prefix)
 
         if self.profile:
-            self.node_runner.info(f"\n--- {self.__class__.__name__} CPU Profile ---")
-            for k, v in self.timing.items(): self.node_runner.info(f"{k:<25}: {v:.4f}s")
+            self._report(f"\n--- {self.__class__.__name__} CPU Profile ---")
+            for k, v in self.timing.items(): self._report(f"{k:<25}: {v:.4f}s")
         return _to_molecule_list(list(final_ranked)[:self.num_confs])
 
 
@@ -378,12 +479,8 @@ class DiversityGA(BaseGA):
         # Track survival to elite (top 20%)
         scored_pop.sort(key=lambda x: x[0])
         elite_size = min(len(scored_pop), max(1, int(self.pop_size * 0.2)))
-        for i in range(elite_size):
-            origin = scored_pop[i][2]
-            self.success_stats[origin][0] += 1
-
-        for _, _, origin in scored_pop:
-            self.success_stats[origin][1] += 1
+        for index, (_, _, origin) in enumerate(scored_pop):
+            self._count_origin(origin, elite=index < elite_size)
 
         # 1. Keep the low-energy candidates according to the selected backend
         min_energy = min(scored_pop, key=lambda x: x[0])[0]
@@ -448,7 +545,7 @@ class DiversityGA(BaseGA):
             f"after [low={np.min(after_scores) if len(after_scores) > 0 else 0:8.4f}, high={np.max(after_scores) if len(after_scores) > 0 else 0:8.4f}] | "
             f"Min energy = {min_energy:10.4f}, Acc = {len(accepted):3d}"
         )
-        self.node_runner.info(output)
+        self._report(output)
         return new_population
 
     def get_pairwise_rmsd_scores(self, pop: Union[np.ndarray, List[InternalCoordinatesList]]) -> np.ndarray:
@@ -505,7 +602,7 @@ class DiversityGA(BaseGA):
         # Save RMSD evolution to CSV
         rmsd_evol_df = pd.DataFrame(h)
         rmsd_evol_df.to_csv("rmsd_evolution.csv", index=False)
-        self.node_runner.info(" RMSD")
+        self._report(" RMSD")
 
         gens = [x["gen"] for x in h]
         plt.figure(figsize=(10, 6))
@@ -543,7 +640,7 @@ class DiversityGA(BaseGA):
         pca_df = pd.DataFrame(res, columns=[f"PC{i + 1}" for i in range(res.shape[1])])
         pca_csv = out / f"dihedral_pca_gen_{gen:04d}.csv"
         pca_df.to_csv(pca_csv, index=False)
-        self.node_runner.info(f" PCA: {pca_csv}")
+        self._report(f" PCA: {pca_csv}")
 
         plt.figure(figsize=(8, 6))
         if n == 2:
@@ -572,18 +669,13 @@ class DiversityGA(BaseGA):
         output_prefix = f"{self.__class__.__name__.lower()}"
         plot_conformer_diversity(self.best_stored, output_prefix=output_prefix)
 
-        # Success stats and reporting (shared with BaseGA.finalize in intent)
-        self.node_runner.info("\n--- GA Success Rates (Elite Survival) ---")
-        for origin, counts in self.success_stats.items():
-            rate = (counts[0] / counts[1] * 100) if counts[1] > 0 else 0
-            self.node_runner.info(f"{origin:<15}: {rate:6.2f}% ({counts[0]}/{counts[1]})")
         self.smart_optimizer.report()
 
         if self.profile:
-            self.node_runner.info(f"\n--- {self.__class__.__name__} CPU Profile ---")
-            for k, v in self.timing.items(): self.node_runner.info(f"{k:<25}: {v:.4f}s")
+            self._report(f"\n--- {self.__class__.__name__} CPU Profile ---")
+            for k, v in self.timing.items(): self._report(f"{k:<25}: {v:.4f}s")
 
-        self.node_runner.info("")
+        self._report("")
         return self.best_stored
 
 

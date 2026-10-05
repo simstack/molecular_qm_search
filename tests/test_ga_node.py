@@ -33,6 +33,8 @@ async def test_node_dispatches_modes_and_returns_molecule_list(monkeypatch, mode
         with pytest.raises(RuntimeError):
             asyncio.get_running_loop()
         received.append(kwargs)
+        kwargs["node_runner"].energy_chart = object()
+        kwargs["node_runner"].operator_stats = object()
         return ranked
     monkeypatch.setattr(module, function, generate)
     runner = SimpleNamespace(info=lambda *args: None)
@@ -41,7 +43,7 @@ async def test_node_dispatches_modes_and_returns_molecule_list(monkeypatch, mode
     result = await module.run_ga_conformer_gen.__wrapped__(
         config, node_runner=runner, evaluator=evaluator,
     )
-    assert result.result is ranked
+    assert result.molecules is ranked
     assert received[0]["evaluator"] is evaluator
     assert received[0]["initial_mol"] is config.initial_molecule
     assert received[0]["parallel_children"] == config.parallel_children
@@ -88,6 +90,14 @@ async def test_node_rejects_unknown_mode():
         await module.run_ga_conformer_gen.__wrapped__(
             config, node_runner=SimpleNamespace(info=lambda *a: None),
         )
+
+
+def test_node_documents_molecule_list_chart_and_statistics():
+    module = importlib.import_module("molecular_qm_search.optimization.ga")
+    parsed = DocstringParser(inspect.getdoc(module.run_ga_conformer_gen)).simstack_results()
+    assert parsed["molecules"]["type"] == "MoleculeList"
+    assert parsed["energy_chart"]["type"] == "ChartArtifactModel"
+    assert parsed["operator_stats"]["type"] == "SimpleTable"
 
 
 @pytest.mark.asyncio

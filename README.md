@@ -65,8 +65,11 @@ conformers = ga.run()
 number of evaluations to run together. A supplied `evaluator` takes
 precedence. Unsupported methods raise.
 
-`run_ga_conformer_gen(GAConfig(...))` provides the SimStack node entry point and
-returns a `MoleculeList` as `node_runner.result`. It runs the synchronous GA in a
+`run_ga_conformer_gen(GAConfig(...))` provides the SimStack node entry point.
+It returns the ranked conformers as `node_runner.molecules` (`MoleculeList`),
+an energy chart of minimum and maximum energy versus iteration, and a table of
+elite-survival success rates for crossover, copy, and mutation by bond type.
+It runs the synchronous GA in a
 worker thread while quantum calculations execute on the parent event loop.
 For direct use from an async workflow, construct the quantum evaluator with
 `loop=asyncio.get_running_loop()` and run the GA using `await asyncio.to_thread(ga.run)`.
