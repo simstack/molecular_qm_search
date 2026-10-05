@@ -3,6 +3,7 @@ from typing import Any, Dict
 
 from odmantic import Field, Model, Reference
 from simstack.models import simstack_model
+from simstack.util.cleaned_json_schema import cleaned_json_schema
 from simstack.util.generate_ui_schema import generate_ui_schema
 
 from molecular_qm_models import Molecule
@@ -66,6 +67,67 @@ class GAConfig(Model):
         title="Rotatable bond maximum",
         description="Upper dihedral bound in degrees for discovered rotatable bonds.",
     )
+
+    @classmethod
+    def ui_schema(cls):
+        ui = generate_ui_schema(cls)
+        ui["field_name"] = {"ui:widget": "hidden"}
+        return ui
+
+
+@simstack_model
+class GAConformerParameters(Model):
+    """GA conformer-generation settings, without the starting molecule.
+
+    ``compare_optimization_methods`` supplies the molecule. Field names and
+    defaults match ``GAConfig`` aside from ``initial_molecule``.
+    """
+
+    field_name: str = "GAConformerParameters"
+    num_confs: int = 50
+    seed: int = 1
+    parallel_children: int = Field(
+        0,
+        title="Parallel children",
+        description="Evaluations to run at the same time. 0 keeps the backend default.",
+    )
+    mode: str = "ga"  # ga, ga-min, ga-select
+    pop_size: int = 100
+    generations: int = 50
+    mutation_rate: float = 0.2
+    crossover_rate: float = 0.5
+    dihedral_interval: float = 30.0
+    optimization_method: GAOptimizationMethod = Field(
+        GAOptimizationMethod.RDKIT_MMFF,
+        title="Optimization method",
+    )
+    backend_options: Dict[str, Any] = {}
+    max_iters: int = 500
+    smart_opt: bool = False
+    n_prune: int = 10
+    prune_rms_thresh: float = 0.1
+    db_treatment: str = "180+step"
+    match_double_bonds: bool = Field(
+        True,
+        title="Match double bonds",
+        description="Include double bonds when the initial rotatable-bond list is built.",
+    )
+    rotatable_bond_min: float = Field(
+        -180.0,
+        title="Rotatable bond minimum",
+        description="Lower dihedral bound in degrees for discovered rotatable bonds.",
+    )
+    rotatable_bond_max: float = Field(
+        180.0,
+        title="Rotatable bond maximum",
+        description="Upper dihedral bound in degrees for discovered rotatable bonds.",
+    )
+
+    @classmethod
+    def json_schema(cls, recursive=True):
+        schema = cleaned_json_schema(cls)
+        schema["title"] = "GA conformer generation"
+        return schema
 
     @classmethod
     def ui_schema(cls):
