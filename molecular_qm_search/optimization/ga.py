@@ -29,8 +29,9 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
         ValueError: missing initial molecule, unknown mode, or invalid GA settings
 
     SimstackResult:
-        molecules (MoleculeList): Ranked conformers produced by the genetic algorithm
+        molecules (MoleculeList): Final population, lowest energy first
         energy_chart (ChartArtifactModel): Minimum and maximum population energy versus iteration
+        energy_histogram (ChartArtifactModel): Histogram of the returned population energies
         operator_stats (SimpleTable): Elite-survival rate of each population-change type
     """
     node_runner = kwargs.get("node_runner")
@@ -95,6 +96,8 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
         raise ValueError(f"GA returned {type(ranked).__name__}, expected a MoleculeList")
     if getattr(node_runner, "energy_chart", None) is None:
         raise ValueError("GA did not produce an energy chart")
+    if getattr(node_runner, "energy_histogram", None) is None:
+        raise ValueError("GA did not produce an energy histogram")
     if getattr(node_runner, "operator_stats", None) is None:
         raise ValueError("GA did not produce operator statistics")
     node_runner.molecules = ranked

@@ -5,13 +5,14 @@ import pickle
 from typing import List, Tuple, Dict, Optional, Union
 from pathlib import Path
 
-from molecular_qm_models import Molecule, MoleculeList, InternalCoordinatesList, prune_conformers
+from molecular_qm_models import Molecule, MoleculeList, InternalCoordinatesList
 from molecular_qm_models.internal_coordinates import InternalCoordinateBondType
 from simstack.core.node_runner import NodeRunner
 from simstack.models.charts_artifact import (
     AGChartAxisConfig,
     AGChartLegendConfig,
     AGChartTitleConfig,
+    AGColumnSeriesConfig,
     AGLineSeriesConfig,
     ChartArtifactModel,
 )
@@ -239,16 +240,49 @@ class BaseGA:
             "max_energy": float(max(energies)),
         })
 
-    def _publish_run_report(self) -> None:
+    def _ranked_population(self, molecules: List[Molecule]) -> MoleculeList:
+        if not molecules:
+            raise ValueError("Final population is empty")
+        for molecule in molecules:
+            energy = molecule.properties.get("energy")
+            if energy is None or not np.isfinite(energy):
+                raise ValueError("Population molecule has no finite energy")
+        ranked = sorted(molecules, key=lambda molecule: float(molecule.properties["energy"]))
+        if len(ranked) > self.num_confs:
+            ranked = ranked[: self.num_confs]
+        return _to_molecule_list(ranked)
+
+    def _publish_run_report(self, molecules: List[Molecule]) -> None:
         if not self.energy_history:
             raise ValueError("GA produced no energy history")
+        spans = []
+        for point in self.energy_history:
+            span = float(point["max_energy"]) - float(point["min_energy"])
+            if span < 0 or not np.isfinite(span):
+                raise ValueError(
+                    f"Iteration {point['iteration']} has an invalid energy range {span}"
+                )
+            spans.append(span)
+        start = 0
+        for index in range(len(spans) - 1):
+            previous, current = spans[index], spans[index + 1]
+            if previous == 0 and current == 0:
+                continue
+            if previous == 0 or current == 0 or max(previous, current) / min(previous, current) > 2:
+                start = index + 1
+        plotted_history = self.energy_history[start:]
+        if start:
+            self._report(
+                f"Dropped {start} initial iterations from the energy plot; "
+                "the min-max energy range changed by more than a factor of 2."
+            )
         data = [
             {
                 "iteration": int(point["iteration"]),
                 "min-energy": float(point["min_energy"]),
                 "max-energy": float(point["max_energy"]),
             }
-            for point in self.energy_history
+            for point in plotted_history
         ]
         series = [
             AGLineSeriesConfig(
@@ -301,6 +335,48 @@ class BaseGA:
                 "success_rate": rate,
             })
         self.node_runner.operator_stats = table
+        energies = [float(molecule.properties["energy"]) for molecule in molecules]
+        if not energies:
+            raise ValueError("Cannot build an energy histogram for an empty population")
+        low, high = min(energies), max(energies)
+        bin_count = 20
+        if high == low:
+            bins = [{"energy": f"{low:.6g}", "count": len(energies)}]
+        else:
+            width = (high - low) / bin_count
+            counts = [0] * bin_count
+            for energy in energies:
+                index = int((energy - low) / width)
+                if index == bin_count:
+                    index = bin_count - 1
+                counts[index] += 1
+            bins = [
+                {
+                    "energy": f"{low + index * width:.6g} – {low + (index + 1) * width:.6g}",
+                    "count": counts[index],
+                }
+                for index in range(bin_count)
+            ]
+        self.node_runner.energy_histogram = ChartArtifactModel(
+            data=bins,
+            title=AGChartTitleConfig(text="Energy histogram"),
+            series=[
+                AGColumnSeriesConfig(
+                    type="column",
+                    xKey="energy",
+                    yKey="count",
+                    title="count",
+                    data=bins,
+                    fill="#45B7D1",
+                )
+            ],
+            axes=[
+                AGChartAxisConfig(type="category", position="bottom", title="energy"),
+                AGChartAxisConfig(type="number", position="left", title="count"),
+            ],
+            legend=AGChartLegendConfig(enabled=False),
+        )
+        self._report(f"Returning {len(molecules)} population molecules.")
 
     def run(self) -> MoleculeList:
         self.setup()
@@ -333,8 +409,9 @@ class BaseGA:
             self._report("No rotatable bonds found.")
             evaluated = self.evaluate_molecules([self.initial_mol], optimize=True)
             self._record_energy_iteration(0, [mol.properties["energy"] for mol in evaluated])
-            self._publish_run_report()
-            return _to_molecule_list(evaluated)
+            molecules = self._ranked_population(evaluated)
+            self._publish_run_report(list(molecules))
+            return molecules
 
         start_gen = 0
         population = None
@@ -368,7 +445,13 @@ class BaseGA:
 
         self.timing["GA Loop"] = time.perf_counter() - t1
         molecules = self.finalize([ind for ind, _ in population])
-        self._publish_run_report()
+        returned = list(molecules)
+        expected = min(self.pop_size, self.num_confs)
+        if len(returned) != expected:
+            raise ValueError(
+                f"Expected {expected} population molecules, got {len(returned)}"
+            )
+        self._publish_run_report(returned)
         return molecules
 
     def selection(
@@ -395,9 +478,7 @@ class BaseGA:
         self.evaluate_population(population)
         # Keep Cartesian optimization results; torsions cannot encode relaxed
         # bond lengths and angles.
-        final_conformers = _to_molecule_list(self.evaluated_molecules)
-
-        final_ranked = prune_conformers(final_conformers, 0.1)
+        final_ranked = self._ranked_population(self.evaluated_molecules)
 
         self.timing["Finalization"] = time.perf_counter() - t2
 
@@ -409,7 +490,7 @@ class BaseGA:
         if self.profile:
             self._report(f"\n--- {self.__class__.__name__} CPU Profile ---")
             for k, v in self.timing.items(): self._report(f"{k:<25}: {v:.4f}s")
-        return _to_molecule_list(list(final_ranked)[:self.num_confs])
+        return final_ranked
 
 
 class StandardGA(BaseGA):
@@ -420,8 +501,7 @@ class StandardGA(BaseGA):
         optimized = self.evaluate_molecules(molecules, optimize=True)
         if optimized:
             self.best_energy_seen = min(m.properties["energy"] for m in optimized)
-        ranked = prune_conformers(_to_molecule_list(optimized), 0.1)
-        return _to_molecule_list(list(ranked)[:self.num_confs])
+        return self._ranked_population(optimized)
 
 
 class MinimizingGA(BaseGA):
@@ -589,9 +669,7 @@ class DiversityGA(BaseGA):
                                            min(m.properties["energy"] for m in temp_ranked))
 
             combined = list(self.best_stored) + temp_ranked
-            combined.sort(key=lambda m: m.properties["energy"])
-            pruned = prune_conformers(_to_molecule_list(combined), self.prune_rms_thresh)
-            self.best_stored = _to_molecule_list(list(pruned)[:self.num_confs])
+            self.best_stored = self._ranked_population(combined)
             self.write_conformers_xyz(self.best_stored, gen)
 
     def plot_rmsd_evolution(self, gen: int):

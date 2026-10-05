@@ -66,9 +66,10 @@ number of evaluations to run together. A supplied `evaluator` takes
 precedence. Unsupported methods raise.
 
 `run_ga_conformer_gen(GAConfig(...))` provides the SimStack node entry point.
-It returns the ranked conformers as `node_runner.molecules` (`MoleculeList`),
-an energy chart of minimum and maximum energy versus iteration, and a table of
-elite-survival success rates for crossover, copy, and mutation by bond type.
+It returns the final population as `node_runner.molecules` (`MoleculeList`),
+an energy chart of minimum and maximum energy versus iteration, a histogram of
+those energies, and a table of elite-survival success rates for crossover,
+copy, and mutation by bond type.
 It runs the synchronous GA in a
 worker thread while quantum calculations execute on the parent event loop.
 For direct use from an async workflow, construct the quantum evaluator with

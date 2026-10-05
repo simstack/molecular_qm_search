@@ -196,7 +196,7 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
         pop_size=12, num_confs=6, generations=2, mutation_rate=1.0, crossover_rate=0.5, seed=1,
     )
     conformers = ga.run()
-    assert len(conformers) > 1
+    assert len(conformers) == 6
     assert "Population:     12" in runner.log_string
     assert "Dihedral Types:" in runner.log_string
     assert runner.log_string == "\n".join(runner.info_messages) + "\n"
@@ -214,6 +214,48 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
     for row in table.row:
         assert 0 <= row["success_rate"] <= 1
         assert row["elite_survivors"] <= row["produced"]
+    histogram = runner.energy_histogram
+    assert histogram.series[0].type == "column"
+    assert histogram.series[0].yKey == "count"
+    assert sum(row["count"] for row in histogram.data) == len(conformers)
+
+
+class SpreadEvaluator:
+    def __init__(self, spans):
+        self.spans = spans
+        self.calls = 0
+
+    def score(self, molecules):
+        if self.calls >= len(self.spans):
+            raise ValueError("SpreadEvaluator received more score calls than spans")
+        span = self.spans[self.calls]
+        self.calls += 1
+        if len(molecules) < 2:
+            raise ValueError("SpreadEvaluator needs at least two molecules")
+        results = []
+        for index, molecule in enumerate(molecules):
+            result = Molecule.from_molecule(molecule)
+            result.properties["energy"] = float(span * index / (len(molecules) - 1))
+            results.append(result)
+        return results
+
+    def optimize(self, molecules, *, max_iters):
+        results = [Molecule.from_molecule(molecule) for molecule in molecules]
+        for index, result in enumerate(results):
+            result.properties["energy"] = float(index)
+        return results
+
+
+def test_energy_plot_drops_iterations_until_range_settles(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runner = RecordingRunner()
+    ga = StandardGA(
+        molecule, runner, evaluator=SpreadEvaluator([100.0, 80.0, 10.0, 8.0]),
+        coordinates=coordinates, pop_size=4, num_confs=4, generations=3, seed=1,
+    )
+    ga.run()
+    assert [row["iteration"] for row in runner.energy_chart.data] == [2, 3]
+    assert "Dropped 2 initial iterations" in runner.log_string
 
 
 def test_restart_restores_generator_random_state(molecule, coordinates, tmp_path, monkeypatch):

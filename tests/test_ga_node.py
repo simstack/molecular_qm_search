@@ -34,6 +34,7 @@ async def test_node_dispatches_modes_and_returns_molecule_list(monkeypatch, mode
             asyncio.get_running_loop()
         received.append(kwargs)
         kwargs["node_runner"].energy_chart = object()
+        kwargs["node_runner"].energy_histogram = object()
         kwargs["node_runner"].operator_stats = object()
         return ranked
     monkeypatch.setattr(module, function, generate)
@@ -97,6 +98,7 @@ def test_node_documents_molecule_list_chart_and_statistics():
     parsed = DocstringParser(inspect.getdoc(module.run_ga_conformer_gen)).simstack_results()
     assert parsed["molecules"]["type"] == "MoleculeList"
     assert parsed["energy_chart"]["type"] == "ChartArtifactModel"
+    assert parsed["energy_histogram"]["type"] == "ChartArtifactModel"
     assert parsed["operator_stats"]["type"] == "SimpleTable"
 
 
