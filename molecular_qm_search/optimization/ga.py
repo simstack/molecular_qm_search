@@ -18,10 +18,11 @@ from .ga_method import (
 async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
     """Generate conformers with a genetic algorithm.
 
-    DFTB and xTB evaluations run as child nodes. RDKit force fields stay in-process.
+    DFTB evaluations run as one dftb_list_calculator child per batch. xTB
+    evaluations run as child nodes. RDKit force fields stay in-process.
 
     Called Nodes:
-        dftb_calculator
+        dftb_list_calculator
         xtb_molecule_list
         xtb_optimize_molecule_list
 
@@ -30,8 +31,9 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
 
     SimstackResult:
         molecules (MoleculeList): Final population, lowest energy first
-        energy_chart (ChartArtifactModel): Minimum and maximum population energy versus iteration
-        energy_histogram (ChartArtifactModel): Histogram of the returned population energies
+        energy_chart (ChartArtifactModel): Minimum and maximum population energy versus iteration, updated every iteration
+        energy_histogram (ChartArtifactModel): Histogram of the population energies, updated every iteration
+        diversity_chart (ChartArtifactModel): PCA of pairwise dihedral RMSD, updated every iteration when the population has at least two conformers
         operator_stats (SimpleTable): Elite-survival rate of each population-change type
     """
     node_runner = kwargs.get("node_runner")
@@ -89,6 +91,7 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
         match_double_bonds=config.match_double_bonds,
         rotatable_bond_min=config.rotatable_bond_min,
         rotatable_bond_max=config.rotatable_bond_max,
+        artifact_loop=asyncio.get_running_loop(),
         **extra_args,
     )
 

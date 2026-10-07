@@ -19,20 +19,42 @@ def dftb_stub(monkeypatch):
     outputs = []
     input_module = types.ModuleType("molecular_qm_dftb.models.dftb_input")
     input_module.DftbInput = lambda **kwargs: SimpleNamespace(**kwargs)
-    calculator_module = types.ModuleType("molecular_qm_dftb.nodes.dftb_calculator")
+    calculator_module = types.ModuleType("molecular_qm_dftb.nodes.dftb_list_calculator")
 
-    async def calculator(molecule, opts, **kwargs):
-        calls.append((molecule, opts, kwargs, asyncio.get_running_loop()))
-        if outputs:
-            return outputs.pop(0)
-        structure = Molecule.from_molecule(molecule)
-        structure.atoms[0].x += 1.0
-        return SimpleNamespace(qm_result=SimpleNamespace(
-            final_energy=-0.5, final_structure=structure,
-            normal_termination=True, scf_converged=True, optimization_converged=True,
-        ))
+    async def calculator(molecules, opts, **kwargs):
+        calls.append((molecules, opts, kwargs, asyncio.get_running_loop()))
+        built = []
+        for molecule in molecules:
+            if outputs:
+                output = outputs.pop(0)
+                qm_result = getattr(output, "qm_result", None)
+                if qm_result is None:
+                    built.append({
+                        "arg_molecule": molecule,
+                        "success": SimpleNamespace(value=False),
+                        "error": SimpleNamespace(value=getattr(output, "error_message", "")),
+                    })
+                    continue
+                built.append({
+                    "arg_molecule": molecule,
+                    "success": SimpleNamespace(value=True),
+                    "result_qm_result": qm_result,
+                })
+                continue
+            structure = Molecule.from_molecule(molecule)
+            structure.atoms[0].x += 1.0
+            built.append({
+                "arg_molecule": molecule,
+                "success": SimpleNamespace(value=True),
+                "result_qm_result": SimpleNamespace(
+                    final_energy=-0.5, final_structure=structure,
+                    normal_termination=True, scf_converged=True, optimization_converged=True,
+                ),
+            })
+        rows = {f"row-{index}": row for index, row in enumerate(reversed(built))}
+        return SimpleNamespace(dataset={"results": rows})
 
-    calculator_module.dftb_calculator = calculator
+    calculator_module.dftb_list_calculator = calculator
     monkeypatch.setitem(sys.modules, input_module.__name__, input_module)
     monkeypatch.setitem(sys.modules, calculator_module.__name__, calculator_module)
     return calls, outputs
@@ -56,6 +78,11 @@ def test_dftb_score_and_optimize_use_options_geometry_and_units(dftb_stub, molec
     assert optimized.properties["energy_hartree"] == -0.5
     assert optimized.properties["label"] == "original"
     assert optimized.properties["optimization_converged"] is True
+    assert "ga_dftb_batch_index" not in scored.properties
+    assert "ga_dftb_batch_index" not in optimized.properties
+    assert len(calls) == 2
+    assert len(list(calls[0][0])) == 1
+    assert len(list(calls[1][0])) == 1
     assert calls[0][1].optimization is False
     assert calls[1][1].optimization is True
     assert calls[1][1].max_optimization_steps == 40
@@ -71,6 +98,8 @@ async def test_dftb_submits_from_worker_to_parent_event_loop(dftb_stub, molecule
     evaluator = DFTBEvaluator(loop=loop)
     results = await asyncio.to_thread(evaluator.score, [molecule, molecule])
     assert len(results) == 2
+    assert len(calls) == 1
+    assert len(list(calls[0][0])) == 2
     assert all(call[3] is loop for call in calls)
     with pytest.raises(RuntimeError, match="asyncio.to_thread"):
         evaluator.score([molecule])
@@ -91,6 +120,20 @@ def test_dftb_failures_are_not_silently_scored(dftb_stub, molecule, failure):
         outputs.append(SimpleNamespace(qm_result=result))
     with pytest.raises(RuntimeError):
         DFTBEvaluator().optimize([molecule], max_iters=5)
+
+
+def test_dftb_list_results_follow_input_order_from_one_call(dftb_stub):
+    calls, _ = dftb_stub
+    first = Molecule(atoms=[Atom(element="H", x=0, y=0, z=0)], properties={"label": "first"})
+    second = Molecule(atoms=[Atom(element="H", x=3, y=0, z=0)], properties={"label": "second"})
+    results = DFTBEvaluator().optimize([first, second], max_iters=5)
+    assert len(calls) == 1
+    assert len(list(calls[0][0])) == 2
+    assert [molecule.properties["label"] for molecule in results] == ["first", "second"]
+    assert results[0].atoms[0].x == pytest.approx(1.0)
+    assert results[1].atoms[0].x == pytest.approx(4.0)
+    assert "ga_dftb_batch_index" not in results[0].properties
+    assert "ga_dftb_batch_index" not in results[1].properties
 
 
 @pytest.mark.parametrize("method,forcefield", [

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import numpy as np
 import time
 import pickle
@@ -14,6 +15,7 @@ from simstack.models.charts_artifact import (
     AGChartTitleConfig,
     AGColumnSeriesConfig,
     AGLineSeriesConfig,
+    AGScatterSeriesConfig,
     ChartArtifactModel,
 )
 from simstack.models.simple_table import SimpleTable, SimpleTableColumnType
@@ -62,6 +64,7 @@ class BaseGA:
             coordinates: Optional[InternalCoordinatesList] = None,
             optimization_method: GAOptimizationMethod = GAOptimizationMethod.RDKIT_MMFF,
             backend_options=None,
+            artifact_loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         self.num_confs = num_confs
         self.pop_size = pop_size
@@ -91,6 +94,8 @@ class BaseGA:
         self.rotatable_bond_max = rotatable_bond_max
         self.timing: Dict[str, float] = {}
         self.energy_history: List[Dict[str, float]] = []
+        self._energy_plot_start: Optional[int] = None
+        self.artifact_loop = artifact_loop
         # [elite survivors, produced] for each population-change label.
         self.success_stats: Dict[str, List[int]] = {}
 
@@ -252,7 +257,7 @@ class BaseGA:
             ranked = ranked[: self.num_confs]
         return _to_molecule_list(ranked)
 
-    def _publish_run_report(self, molecules: List[Molecule]) -> None:
+    def _publish_energy_chart(self) -> None:
         if not self.energy_history:
             raise ValueError("GA produced no energy history")
         spans = []
@@ -270,12 +275,13 @@ class BaseGA:
                 continue
             if previous == 0 or current == 0 or max(previous, current) / min(previous, current) > 2:
                 start = index + 1
-        plotted_history = self.energy_history[start:]
-        if start:
+        if start and start != self._energy_plot_start:
             self._report(
                 f"Dropped {start} initial iterations from the energy plot; "
                 "the min-max energy range changed by more than a factor of 2."
             )
+        self._energy_plot_start = start
+        plotted_history = self.energy_history[start:]
         data = [
             {
                 "iteration": int(point["iteration"]),
@@ -302,6 +308,11 @@ class BaseGA:
                 stroke="#FF6B6B",
             ),
         ]
+        chart = getattr(self.node_runner, "energy_chart", None)
+        if isinstance(chart, ChartArtifactModel):
+            chart.data = data
+            chart.series = series
+            return
         self.node_runner.energy_chart = ChartArtifactModel(
             data=data,
             title=AGChartTitleConfig(text="Energy vs iteration"),
@@ -312,6 +323,162 @@ class BaseGA:
             ],
             legend=AGChartLegendConfig(enabled=True, position="right"),
         )
+
+    def _publish_energy_histogram(self, energies: List[float]) -> None:
+        if not energies:
+            raise ValueError("Cannot build an energy histogram for an empty population")
+        low, high = min(energies), max(energies)
+        bin_count = 20
+        if high == low:
+            bins = [{"energy": f"{low:.6g}", "count": len(energies)}]
+        else:
+            width = (high - low) / bin_count
+            counts = [0] * bin_count
+            for energy in energies:
+                index = int((energy - low) / width)
+                if index == bin_count:
+                    index = bin_count - 1
+                counts[index] += 1
+            bins = [
+                {
+                    "energy": f"{low + index * width:.6g} – {low + (index + 1) * width:.6g}",
+                    "count": counts[index],
+                }
+                for index in range(bin_count)
+            ]
+        series = [
+            AGColumnSeriesConfig(
+                type="column",
+                xKey="energy",
+                yKey="count",
+                title="count",
+                data=bins,
+                fill="#45B7D1",
+            )
+        ]
+        chart = getattr(self.node_runner, "energy_histogram", None)
+        if isinstance(chart, ChartArtifactModel):
+            chart.data = bins
+            chart.series = series
+            return
+        self.node_runner.energy_histogram = ChartArtifactModel(
+            data=bins,
+            title=AGChartTitleConfig(text="Energy histogram"),
+            series=series,
+            axes=[
+                AGChartAxisConfig(type="category", position="bottom", title="energy"),
+                AGChartAxisConfig(type="number", position="left", title="count"),
+            ],
+            legend=AGChartLegendConfig(enabled=False),
+        )
+
+    def _publish_diversity_chart(self, population: List[InternalCoordinatesList]) -> None:
+        if len(population) < 2:
+            return
+        width = len(population[0].elements)
+        if width < 1:
+            raise ValueError("Diversity analysis needs dihedral coordinates")
+        angles = []
+        for individual in population:
+            if len(individual.elements) != width:
+                raise ValueError("Diversity analysis received inconsistent dihedral lists")
+            angles.append([
+                coordinate.get_actual_value(coordinate.value)
+                for coordinate in individual.elements
+            ])
+        radians = np.deg2rad(np.asarray(angles, dtype=float))
+        differences = radians[:, None, :] - radians[None, :, :]
+        differences = (differences + np.pi) % (2 * np.pi) - np.pi
+        rmsd = np.sqrt(np.mean(np.square(np.rad2deg(differences)), axis=-1))
+        if rmsd.shape != (len(population), len(population)) or not np.isfinite(rmsd).all():
+            raise ValueError("Pairwise dihedral RMSD is not finite")
+        centered = rmsd - rmsd.mean(axis=0, keepdims=True)
+        singular_vectors, singular_values, _ = np.linalg.svd(centered, full_matrices=False)
+        total = float(np.sum(np.square(singular_values)))
+        embedding = np.zeros((len(population), 2))
+        percents = []
+        for rank in range(min(2, singular_vectors.shape[1])):
+            embedding[:, rank] = singular_vectors[:, rank] * singular_values[rank]
+            percents.append(0.0 if total == 0 else 100.0 * float(singular_values[rank] ** 2) / total)
+        while len(percents) < 2:
+            percents.append(0.0)
+        points = [
+            {"pc1": float(embedding[index, 0]), "pc2": float(embedding[index, 1])}
+            for index in range(len(population))
+        ]
+        series = [
+            AGScatterSeriesConfig(
+                type="scatter",
+                xKey="pc1",
+                yKey="pc2",
+                title="conformers",
+                data=points,
+                fill="#2A9D8F",
+            )
+        ]
+        title = AGChartTitleConfig(
+            text=f"Dihedral RMSD PCA (PC1 {percents[0]:.1f}%, PC2 {percents[1]:.1f}%)"
+        )
+        chart = getattr(self.node_runner, "diversity_chart", None)
+        if isinstance(chart, ChartArtifactModel):
+            chart.title = title
+            chart.data = points
+            chart.series = series
+            return
+        self.node_runner.diversity_chart = ChartArtifactModel(
+            data=points,
+            title=title,
+            series=series,
+            axes=[
+                AGChartAxisConfig(type="number", position="bottom", title="PC1"),
+                AGChartAxisConfig(type="number", position="left", title="PC2"),
+            ],
+            legend=AGChartLegendConfig(enabled=False),
+        )
+
+    def _persist_live_artifacts(self) -> None:
+        from odmantic import ObjectId
+        from simstack.core.context import context
+
+        if not context.initialized:
+            return
+        task_id = getattr(self.node_runner, "task_id", None)
+        if task_id is None:
+            return
+        if self.artifact_loop is None:
+            raise RuntimeError("Cannot publish GA artifacts while running without the node event loop")
+        if not self.artifact_loop.is_running():
+            raise RuntimeError("The node event loop is not running, so GA artifacts cannot be published")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            running_on_loop = False
+        else:
+            running_on_loop = True
+        if running_on_loop:
+            raise RuntimeError("Publish GA artifacts from the worker thread, not the event loop")
+        parent_id = task_id if isinstance(task_id, ObjectId) else ObjectId(str(task_id))
+        charts = []
+        for name in ("energy_chart", "energy_histogram", "diversity_chart"):
+            chart = getattr(self.node_runner, name, None)
+            if chart is None:
+                continue
+            if not isinstance(chart, ChartArtifactModel):
+                raise ValueError(f"GA artifact {name} is {type(chart).__name__}, expected ChartArtifactModel")
+            chart.parent_id = parent_id
+            charts.append(chart)
+
+        async def save_charts():
+            for chart in charts:
+                await context.db.save(chart)
+
+        asyncio.run_coroutine_threadsafe(save_charts(), self.artifact_loop).result()
+
+    def _publish_run_report(self, molecules: List[Molecule]) -> None:
+        self._publish_energy_chart()
+        self._publish_energy_histogram([
+            float(molecule.properties["energy"]) for molecule in molecules
+        ])
         table = SimpleTable(name="Population change success rates")
         table.add_column("change", SimpleTableColumnType.STRING)
         table.add_column("produced", SimpleTableColumnType.NUMBER)
@@ -335,47 +502,7 @@ class BaseGA:
                 "success_rate": rate,
             })
         self.node_runner.operator_stats = table
-        energies = [float(molecule.properties["energy"]) for molecule in molecules]
-        if not energies:
-            raise ValueError("Cannot build an energy histogram for an empty population")
-        low, high = min(energies), max(energies)
-        bin_count = 20
-        if high == low:
-            bins = [{"energy": f"{low:.6g}", "count": len(energies)}]
-        else:
-            width = (high - low) / bin_count
-            counts = [0] * bin_count
-            for energy in energies:
-                index = int((energy - low) / width)
-                if index == bin_count:
-                    index = bin_count - 1
-                counts[index] += 1
-            bins = [
-                {
-                    "energy": f"{low + index * width:.6g} – {low + (index + 1) * width:.6g}",
-                    "count": counts[index],
-                }
-                for index in range(bin_count)
-            ]
-        self.node_runner.energy_histogram = ChartArtifactModel(
-            data=bins,
-            title=AGChartTitleConfig(text="Energy histogram"),
-            series=[
-                AGColumnSeriesConfig(
-                    type="column",
-                    xKey="energy",
-                    yKey="count",
-                    title="count",
-                    data=bins,
-                    fill="#45B7D1",
-                )
-            ],
-            axes=[
-                AGChartAxisConfig(type="category", position="bottom", title="energy"),
-                AGChartAxisConfig(type="number", position="left", title="count"),
-            ],
-            legend=AGChartLegendConfig(enabled=False),
-        )
+        self._persist_live_artifacts()
         self._report(f"Returning {len(molecules)} population molecules.")
 
     def run(self) -> MoleculeList:
@@ -432,7 +559,13 @@ class BaseGA:
                 raise ValueError(
                     f"Evaluator returned {len(scored_pop)} energies for {len(population)} individuals"
                 )
-            self._record_energy_iteration(gen, [energy for energy, _ in scored_pop])
+            energies = [energy for energy, _ in scored_pop]
+            scored_coords = [ind for _, ind in scored_pop]
+            self._record_energy_iteration(gen, energies)
+            self._publish_energy_chart()
+            self._publish_energy_histogram(energies)
+            self._publish_diversity_chart(scored_coords)
+            self._persist_live_artifacts()
             # Re-attach labels
             scored_with_labels = [(scored_pop[i][0], scored_pop[i][1], population[i][1]) for i in
                                   range(len(population))]

@@ -218,6 +218,58 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
     assert histogram.series[0].type == "column"
     assert histogram.series[0].yKey == "count"
     assert sum(row["count"] for row in histogram.data) == len(conformers)
+    assert runner.diversity_chart.series[0].type == "scatter"
+    assert len(runner.diversity_chart.data) == 12
+    assert {key for row in runner.diversity_chart.data for key in row} == {"pc1", "pc2"}
+
+
+def test_charts_refresh_on_every_iteration(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runner = RecordingRunner()
+    seen = []
+
+    class WatchingEvaluator(DistinctGeometryEvaluator):
+        def score(self, molecules):
+            chart = getattr(runner, "energy_chart", None)
+            if chart is not None:
+                seen.append({
+                    "iterations": [row["iteration"] for row in chart.data],
+                    "histogram": sum(row["count"] for row in runner.energy_histogram.data),
+                    "diversity": len(runner.diversity_chart.data),
+                })
+            return super().score(molecules)
+
+    ga = StandardGA(
+        molecule, runner, evaluator=WatchingEvaluator(), coordinates=coordinates,
+        pop_size=4, num_confs=4, generations=2, mutation_rate=1.0, seed=1,
+    )
+    ga.run()
+    assert seen == [
+        {"iterations": [0], "histogram": 4, "diversity": 4},
+        {"iterations": [0, 1], "histogram": 4, "diversity": 4},
+        {"iterations": [0, 1, 2], "histogram": 4, "diversity": 4},
+    ]
+    assert [row["iteration"] for row in runner.energy_chart.data] == [0, 1, 2]
+
+
+def test_diversity_chart_separates_distinct_dihedrals(molecule, coordinates):
+    runner = RecordingRunner()
+    ga = StandardGA(
+        molecule, runner, evaluator=Evaluator(), coordinates=coordinates, pop_size=2, num_confs=2,
+    )
+    ga.setup()
+    folded = copy.deepcopy(ga.template_coords)
+    extended = copy.deepcopy(ga.template_coords)
+    folded.elements[0].value = 0.0
+    extended.elements[0].value = 0.5
+    ga._publish_diversity_chart([folded, extended])
+    points = runner.diversity_chart.data
+    assert points[0]["pc1"] != pytest.approx(points[1]["pc1"])
+    same = copy.deepcopy(folded)
+    ga._publish_diversity_chart([folded, same])
+    collapsed = runner.diversity_chart.data
+    assert collapsed[0]["pc1"] == pytest.approx(0.0)
+    assert collapsed[1]["pc1"] == pytest.approx(0.0)
 
 
 class SpreadEvaluator:

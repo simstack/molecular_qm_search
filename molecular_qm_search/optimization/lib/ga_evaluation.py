@@ -114,22 +114,83 @@ class NodeMoleculeEvaluator:
 
 
 class DFTBEvaluator(NodeMoleculeEvaluator):
-    """Evaluate with molecular_qm_dftb's dftb_calculator node."""
+    """Evaluate a batch with molecular_qm_dftb's dftb_list_calculator node.
+
+    One list-calculator call covers the whole batch. A per-molecule index is
+    stored only on the submitted copies so identical geometries stay distinct
+    inside MassRunner; it is removed from returned properties.
+    """
+
+    _BATCH_INDEX = "ga_dftb_batch_index"
 
     async def _evaluate(self, molecules, *, optimize, max_iters):
         from molecular_qm_dftb.models.dftb_input import DftbInput
-        from molecular_qm_dftb.nodes.dftb_calculator import dftb_calculator
+        from molecular_qm_dftb.nodes.dftb_list_calculator import dftb_list_calculator
 
         options = dict(self.options)
         options.update(optimization=optimize, max_optimization_steps=max_iters,
                        tolerate_failure=False)
         opts = DftbInput(**options)
+        batch = MoleculeList()
+        submitted = []
+        for index, molecule in enumerate(molecules):
+            copied = Molecule.from_molecule(molecule)
+            copied.properties = copy.deepcopy(molecule.properties)
+            copied.properties[self._BATCH_INDEX] = index
+            batch.add_molecule(copied)
+            submitted.append(copied)
+        output = await dftb_list_calculator(batch, opts, **self.node_kwargs)
+        dataset = None if output is None else getattr(output, "dataset", None)
+        if dataset is None and output is not None and (
+            isinstance(output, dict) or hasattr(output, "sections")
+        ) and "results" in output:
+            dataset = output
+        if dataset is None:
+            raise RuntimeError("dftb_list_calculator did not return a dataset")
+        if "results" not in dataset:
+            raise RuntimeError("dftb_list_calculator dataset has no results section")
+        rows = dataset["results"]
+        if (
+            hasattr(rows, "data")
+            and rows.data
+            and hasattr(rows, "load_to_cache")
+            and len(rows) == 0
+        ):
+            from simstack.core.context import context
+
+            await rows.load_to_cache(context.db)
+
+        rows_by_id = {}
+        for _row_name, row in rows.items():
+            source = row.get("arg_molecule")
+            if source is None or getattr(source, "id", None) is None:
+                raise RuntimeError("DFTB list result row is missing the input molecule")
+            if source.id in rows_by_id:
+                raise RuntimeError("DFTB list returned duplicate rows for one molecule")
+            rows_by_id[source.id] = row
+        if len(rows_by_id) != len(submitted):
+            raise RuntimeError(
+                f"DFTB list returned {len(rows_by_id)} rows for {len(submitted)} molecules"
+            )
+
         results = []
-        for molecule in molecules:
-            output = await dftb_calculator(molecule, opts, **self.node_kwargs)
-            qm_result = getattr(output, "qm_result", None)
+        for molecule, submitted_molecule in zip(molecules, submitted):
+            row = rows_by_id.get(submitted_molecule.id)
+            if row is None:
+                raise RuntimeError("DFTB list result is missing a submitted molecule")
+            success = row.get("success")
+            if success is None:
+                raise RuntimeError("DFTB result row is missing success")
+            success_value = success.value if hasattr(success, "value") else success
+            if not success_value:
+                error = row.get("error")
+                if error is None:
+                    raise RuntimeError("DFTB calculation failed")
+                error_msg = error.value if hasattr(error, "value") else error
+                raise RuntimeError(f"DFTB calculation failed: {error_msg}")
+            qm_result = row.get("result_qm_result")
             if qm_result is None or qm_result.final_energy is None:
-                raise RuntimeError(f"DFTB returned no energy: {getattr(output, 'error_message', '')}")
+                raise RuntimeError("DFTB returned no energy")
             if qm_result.normal_termination is False or qm_result.scf_converged is False:
                 raise RuntimeError("DFTB calculation did not complete successfully")
             structure = qm_result.final_structure if optimize else molecule
@@ -137,7 +198,9 @@ class DFTBEvaluator(NodeMoleculeEvaluator):
                 raise RuntimeError("DFTB optimization returned no final structure")
             result = Molecule.from_molecule(structure)
             result.properties = copy.deepcopy(molecule.properties)
-            result.properties.update(copy.deepcopy(structure.properties))
+            structure_properties = copy.deepcopy(structure.properties)
+            structure_properties.pop(self._BATCH_INDEX, None)
+            result.properties.update(structure_properties)
             result.properties.pop("rank_id", None)
             result.properties.pop("optimization_converged", None)
             result.properties.update(

@@ -34,7 +34,7 @@ Available adapters:
 - `RDKitEvaluator`: calls `score_molecules_rdkit` and `optimize_molecules_rdkit`
   in `molecular_qm_util`. Supports MMFF94, MMFF94s and UFF. RDKit conversion,
   force-field construction and threaded batch evaluation stay in that package.
-- `DFTBEvaluator`: calls `molecular_qm_dftb.nodes.dftb_calculator` with `DftbInput`.
+- `DFTBEvaluator`: calls `molecular_qm_dftb.nodes.dftb_list_calculator` once per batch with `DftbInput`.
 - `XTBEvaluator`: calls `xtb_molecule_list` and `xtb_optimize_molecule_list` from
   `molecular_qm_psi4.nodes.crest`, using `XTBInput`. Use a version of that sister
   repository with `XTBInput.max_iters` to honor GA optimization budgets.

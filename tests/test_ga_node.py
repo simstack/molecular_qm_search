@@ -12,7 +12,7 @@ from molecular_qm_models import Molecule, MoleculeList
 from molecular_qm_search.optimization.models.ga_models import GAConfig, GAOptimizationMethod
 
 CALCULATOR_NODES = {
-    "dftb_calculator": "molecular_qm_dftb.nodes.dftb_calculator.dftb_calculator",
+    "dftb_list_calculator": "molecular_qm_dftb.nodes.dftb_list_calculator.dftb_list_calculator",
     "xtb_molecule_list": "molecular_qm_psi4.nodes.crest.xtb_molecule_list",
     "xtb_optimize_molecule_list": "molecular_qm_psi4.nodes.crest.xtb_optimize_molecule_list",
 }
@@ -99,6 +99,7 @@ def test_node_documents_molecule_list_chart_and_statistics():
     assert parsed["molecules"]["type"] == "MoleculeList"
     assert parsed["energy_chart"]["type"] == "ChartArtifactModel"
     assert parsed["energy_histogram"]["type"] == "ChartArtifactModel"
+    assert parsed["diversity_chart"]["type"] == "ChartArtifactModel"
     assert parsed["operator_stats"]["type"] == "SimpleTable"
 
 
