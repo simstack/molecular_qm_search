@@ -2,19 +2,39 @@
 from __future__ import annotations
 
 import copy
+import math
 import random
 
 from molecular_qm_models import InternalCoordinatesList, Molecule
 from molecular_qm_models.internal_coordinates import InternalCoordinateBondType
 
 
+def dihedral_rmsd(left: InternalCoordinatesList, right: InternalCoordinatesList) -> float:
+    """Circular root-mean-square difference of dihedral angles, in degrees."""
+    if len(left.elements) != len(right.elements):
+        raise ValueError(
+            f"Dihedral lists differ in length ({len(left.elements)} and {len(right.elements)})"
+        )
+    if not left.elements:
+        return 0.0
+    squares = []
+    for first, second in zip(left.elements, right.elements):
+        difference = abs(first.get_actual_value(first.value) - second.get_actual_value(second.value)) % 360
+        if difference > 180:
+            difference = 360 - difference
+        squares.append(difference * difference)
+    return math.sqrt(sum(squares) / len(squares))
+
+
 class PopulationGenerator:
     def __init__(self, molecule: Molecule, *, coordinates=None, seed=1,
-                 mutation_rate=0.2, crossover_rate=0.5, dihedral_interval=30.0,
+                 mutation_rate=0.2, dihedral_interval=30.0,
                  db_treatment="180+step", match_double_bonds=True,
                  rotatable_bond_min=-180.0, rotatable_bond_max=180.0):
         if db_treatment not in {"ignore", "180+step", "treat-as-single"}:
             raise ValueError(f"Unknown double-bond treatment: {db_treatment}")
+        if not 0 <= mutation_rate <= 1:
+            raise ValueError("Mutation rate must lie in [0, 1]")
         if rotatable_bond_max <= rotatable_bond_min:
             raise ValueError(
                 f"rotatable_bond_max ({rotatable_bond_max}) must be greater than "
@@ -41,9 +61,9 @@ class PopulationGenerator:
             coord.compute(self.molecule)
         self.random = random.Random(seed)
         self.mutation_rate = mutation_rate
-        self.crossover_rate = crossover_rate
         self.dihedral_interval = dihedral_interval
         self.db_treatment = db_treatment
+        self.rejected_rmsd = None
 
     def molecule_from_coordinates(self, coordinates: InternalCoordinatesList) -> Molecule:
         result = self._copy_molecule(self.molecule)
@@ -80,42 +100,84 @@ class PopulationGenerator:
         coord.value = (angle - low) / span
         coord.real_values = [angle]
 
-    def generate(self, size: int) -> list[tuple[InternalCoordinatesList, str]]:
+    def generate(self, size: int) -> list[tuple[InternalCoordinatesList, str, None]]:
         if size < 1:
             raise ValueError("Population size must be positive")
-        population = [(copy.deepcopy(self.coordinates), "initial")]
+        population = [(copy.deepcopy(self.coordinates), "initial", None)]
         for _ in range(size - 1):
             individual = copy.deepcopy(self.coordinates)
             for coord in individual.elements:
                 self._shift(coord, self.random.uniform(-180, 180))
-            population.append((individual, "initial"))
+            population.append((individual, "initial", None))
         return population
 
-    def reproduce(self, parents, target_size):
+    def reproduce(self, parents, target_size, prune_rms_thresh):
+        """Carry parents once and append only new mutations or crossovers.
+
+        Each parent is ``(coordinates, origin, energy)``. Added conformers have
+        energy ``None``. A proposal closer than ``prune_rms_thresh`` degrees to
+        a conformer already kept is discarded. After ``target_size`` discarded
+        proposals in a row, the returned population is shorter than requested
+        and ``rejected_rmsd`` is the last discarded distance.
+        """
         if not parents:
             raise ValueError("Cannot reproduce an empty population")
-        population = copy.deepcopy(parents[:target_size])
+        if target_size < 1:
+            raise ValueError("Population size must be positive")
+        if not math.isfinite(prune_rms_thresh) or prune_rms_thresh <= 0:
+            raise ValueError(
+                f"prune_rms_thresh must be a positive finite dihedral RMSD in degrees, "
+                f"got {prune_rms_thresh}"
+            )
+        if len(parents) > target_size:
+            raise ValueError(
+                f"Cannot carry {len(parents)} parents into a population of {target_size}"
+            )
+        for parent in parents:
+            if not isinstance(parent, tuple) or len(parent) != 3:
+                raise ValueError("Parent conformers must carry coordinates, origin, and energy")
+        population = list(parents)
+        self.rejected_rmsd = None
+        rejected = 0
         n_coords = len(self.coordinates.elements)
         while len(population) < target_size:
-            if n_coords and self.random.random() < self.crossover_rate and len(parents) >= 2:
-                first, second = self.random.sample([ind for ind, _ in parents], 2)
-                point = self.random.randrange(n_coords)
-                child = InternalCoordinatesList(elements=copy.deepcopy(
-                    first.elements[:point] + second.elements[point:]
-                ))
-                origin = "crossover"
-            else:
-                child = copy.deepcopy(self.random.choice(parents)[0])
-                origin = "copy"
-                if n_coords and self.random.random() < self.mutation_rate:
-                    coord = child.elements[self.random.randrange(n_coords)]
+            if rejected >= target_size:
+                break
+            if self.random.random() < self.mutation_rate:
+                donor = copy.deepcopy(self.random.choice(parents)[0])
+                if n_coords == 0:
+                    child, origin, distance = None, None, 0.0
+                else:
+                    coord = donor.elements[self.random.randrange(n_coords)]
                     delta = self.random.uniform(-self.dihedral_interval, self.dihedral_interval)
                     if (self.db_treatment == "180+step"
                             and coord.bond_type == InternalCoordinateBondType.DOUBLE):
                         delta += 180.0
-                    self._shift(coord, delta)
-                    if coord.bond_type is None or not hasattr(coord.bond_type, "value"):
-                        raise ValueError(f"Mutated coordinate has no bond type: {coord.bond_type!r}")
-                    origin = f"mutation-{coord.bond_type.value}"
-            population.append((child, origin))
+                    if delta == 0:
+                        child, origin, distance = None, None, 0.0
+                    else:
+                        self._shift(coord, delta)
+                        if coord.bond_type is None or not hasattr(coord.bond_type, "value"):
+                            raise ValueError(f"Mutated coordinate has no bond type: {coord.bond_type!r}")
+                        child, origin = donor, f"mutation-{coord.bond_type.value}"
+                        distance = min(dihedral_rmsd(child, kept[0]) for kept in population)
+            else:
+                if len(parents) < 2:
+                    raise ValueError("Crossover requires two parents")
+                if n_coords == 0:
+                    child, origin, distance = None, None, 0.0
+                else:
+                    first, second = self.random.sample([individual[0] for individual in parents], 2)
+                    point = self.random.randrange(n_coords)
+                    child = InternalCoordinatesList(elements=copy.deepcopy(
+                        first.elements[:point] + second.elements[point:]
+                    ))
+                    origin = "crossover"
+                    distance = min(dihedral_rmsd(child, kept[0]) for kept in population)
+            if child is None or distance < prune_rms_thresh:
+                rejected += 1
+                self.rejected_rmsd = 0.0 if child is None else distance
+                continue
+            rejected = 0
+            population.append((child, origin, None))
         return population

@@ -58,7 +58,6 @@ def mutated_dihedral_molecules(molecule: Molecule) -> list[Molecule]:
         coordinates=coordinates,
         seed=1,
         mutation_rate=1.0,
-        crossover_rate=0.0,
         dihedral_interval=30.0,
         db_treatment="180+step",
     )

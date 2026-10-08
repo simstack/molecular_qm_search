@@ -20,7 +20,7 @@ from simstack.models.charts_artifact import (
 )
 from simstack.models.simple_table import SimpleTable, SimpleTableColumnType
 
-from .ga_population import PopulationGenerator
+from .ga_population import PopulationGenerator, dihedral_rmsd
 from molecular_qm_search.optimization.lib.ga_evaluation import MoleculeEvaluator, make_evaluator, validate_results
 from molecular_qm_search.optimization.lib.ga_smart_optimizer import SmartOptimizer
 from molecular_qm_search.optimization.models.ga_models import GAOptimizationMethod
@@ -48,8 +48,8 @@ class BaseGA:
             pop_size: int = 100,
             generations: int = 50,
             mutation_rate: float = 0.2,
-            crossover_rate: float = 0.5,
             dihedral_interval: float = 30.0,
+            prune_rms_thresh: float = 0.1,
             seed: int = 1,
             max_iters: int = 500,
             parallel_children: int = 0,
@@ -70,8 +70,8 @@ class BaseGA:
         self.pop_size = pop_size
         self.generations = generations
         self.mutation_rate = mutation_rate
-        self.crossover_rate = crossover_rate
         self.dihedral_interval = dihedral_interval
+        self.prune_rms_thresh = prune_rms_thresh
         self.seed = seed
         self.max_iters = max_iters
         self.parallel_children = parallel_children
@@ -101,8 +101,13 @@ class BaseGA:
 
         if pop_size < 1 or num_confs < 1 or generations < 0:
             raise ValueError("Population and conformer counts must be positive; generations cannot be negative")
-        if not 0 <= mutation_rate <= 1 or not 0 <= crossover_rate <= 1:
-            raise ValueError("Mutation and crossover rates must lie in [0, 1]")
+        if not 0 <= mutation_rate <= 1:
+            raise ValueError("Mutation rate must lie in [0, 1]")
+        if not np.isfinite(prune_rms_thresh) or prune_rms_thresh <= 0:
+            raise ValueError(
+                f"prune_rms_thresh must be a positive finite dihedral RMSD in degrees, "
+                f"got {prune_rms_thresh}"
+            )
         if max_iters < 0 or parallel_children < 0 or dihedral_interval < 0:
             raise ValueError("Iteration, parallel children, and dihedral-step values cannot be negative")
         if rotatable_bond_max <= rotatable_bond_min:
@@ -136,7 +141,7 @@ class BaseGA:
             results = self.evaluator.score(molecules)
         return validate_results(molecules, results)
 
-    def save_state(self, population: List[Tuple[InternalCoordinatesList, str]], gen: int):
+    def save_state(self, population, gen: int):
         state = {
             "population": population,
             "gen": gen,
@@ -146,37 +151,49 @@ class BaseGA:
             "best_energy_seen": self.best_energy_seen,
             "random_state": self.population_generator.random.getstate()
         }
-        # DiversityGA specific data
         if hasattr(self, "rmsd_history"):
             state["rmsd_history"] = self.rmsd_history
+        if hasattr(self, "relaxed"):
+            state["relaxed"] = [self.relaxed.get(id(coords)) for coords, _, _ in population]
 
         with open("ga_state.pkl", "wb") as f:
             pickle.dump(state, f)
         self._report(f"Saved GA state of generation {gen}.")
 
-    def load_state(self) -> Optional[Tuple[List[Tuple[InternalCoordinatesList, str]], int]]:
+    def load_state(self):
         if not Path("ga_state.pkl").exists():
             return None
         try:
             with open("ga_state.pkl", "rb") as f:
                 state = pickle.load(f)
-            if "random_state" in state:
-                self.population_generator.random.setstate(state["random_state"])
-            if "energy_history" not in state:
-                raise ValueError("GA checkpoint has no energy_history")
-            if "success_stats" not in state:
-                raise ValueError("GA checkpoint has no success_stats")
-            self.best_stored = state.get("best_stored", MoleculeList())
-            self.success_stats = state["success_stats"]
-            self.energy_history = state["energy_history"]
-            self.best_energy_seen = state.get("best_energy_seen", float('inf'))
-            if hasattr(self, "rmsd_history") and "rmsd_history" in state:
-                self.rmsd_history = state["rmsd_history"]
-            self._report(f"Loaded GA state from generation {state['gen']}.")
-            return state["population"], state["gen"]
         except Exception as e:
             self.node_runner.error(f"Failed to load GA state: {e}")
             return None
+        if "random_state" in state:
+            self.population_generator.random.setstate(state["random_state"])
+        if "energy_history" not in state:
+            raise ValueError("GA checkpoint has no energy_history")
+        if "success_stats" not in state:
+            raise ValueError("GA checkpoint has no success_stats")
+        population = state.get("population")
+        if not population or any(not isinstance(item, tuple) or len(item) != 3 for item in population):
+            raise ValueError("GA checkpoint population has no energies")
+        self.best_stored = state.get("best_stored", MoleculeList())
+        self.success_stats = state["success_stats"]
+        self.energy_history = state["energy_history"]
+        self.best_energy_seen = state.get("best_energy_seen", float('inf'))
+        if hasattr(self, "rmsd_history") and "rmsd_history" in state:
+            self.rmsd_history = state["rmsd_history"]
+        if hasattr(self, "relaxed"):
+            relaxed = state.get("relaxed")
+            if relaxed is None or len(relaxed) != len(population):
+                raise ValueError("GA checkpoint is missing relaxed geometries")
+            self.relaxed = {}
+            for (coords, _, _), molecule in zip(population, relaxed):
+                if molecule is not None:
+                    self.relaxed[id(coords)] = molecule
+        self._report(f"Loaded GA state from generation {state['gen']}.")
+        return population, state["gen"]
 
     def setup(self):
         """Prepare internal coordinates without scoring or optimizing geometry."""
@@ -185,7 +202,7 @@ class BaseGA:
             raise ValueError("Provide an initial Molecule")
         self.population_generator = PopulationGenerator(
             self.initial_mol, coordinates=self.input_coordinates, seed=self.seed,
-            mutation_rate=self.mutation_rate, crossover_rate=self.crossover_rate,
+            mutation_rate=self.mutation_rate,
             dihedral_interval=self.dihedral_interval, db_treatment=self.db_treatment,
             match_double_bonds=self.match_double_bonds,
             rotatable_bond_min=self.rotatable_bond_min,
@@ -206,23 +223,12 @@ class BaseGA:
                 for mol, ind in zip(self.evaluated_molecules, population)]
 
     def reproduce(self, best_individuals, target_size):
-        return self.population_generator.reproduce(best_individuals, target_size)
+        return self.population_generator.reproduce(
+            best_individuals, target_size, self.prune_rms_thresh,
+        )
 
-    def dihedral_rmsd(self, ind1: Union[InternalCoordinatesList, np.ndarray], ind2: Union[InternalCoordinatesList, np.ndarray]) -> float:
-        """
-        Vectorized dihedral RMSD calculation using NumPy.
-        """
-        if isinstance(ind1, InternalCoordinatesList):
-            arr1 = np.array([c.get_actual_value(c.value) for c in ind1.elements])
-        else:
-            arr1 = np.asarray(ind1)
-        if isinstance(ind2, InternalCoordinatesList):
-            arr2 = np.array([c.get_actual_value(c.value) for c in ind2.elements])
-        else:
-            arr2 = np.asarray(ind2)
-        diffs = np.abs(arr1 - arr2) % 360
-        diffs = np.where(diffs > 180, 360 - diffs, diffs)
-        return float(np.sqrt(np.mean(np.square(diffs))))
+    def dihedral_rmsd(self, ind1: InternalCoordinatesList, ind2: InternalCoordinatesList) -> float:
+        return dihedral_rmsd(ind1, ind2)
 
     def _report(self, message: str) -> None:
         """Send a message to the task log and the node runner info log."""
@@ -253,9 +259,47 @@ class BaseGA:
             if energy is None or not np.isfinite(energy):
                 raise ValueError("Population molecule has no finite energy")
         ranked = sorted(molecules, key=lambda molecule: float(molecule.properties["energy"]))
-        if len(ranked) > self.num_confs:
-            ranked = ranked[: self.num_confs]
-        return _to_molecule_list(ranked)
+        kept = []
+        kept_coords = []
+        for molecule in ranked:
+            coords = self.coordinates_from_molecule(molecule)
+            if any(self.dihedral_rmsd(coords, previous) < self.prune_rms_thresh for previous in kept_coords):
+                continue
+            kept.append(molecule)
+            kept_coords.append(coords)
+            if len(kept) == self.num_confs:
+                break
+        if not kept:
+            raise ValueError("Final population is empty")
+        return _to_molecule_list(kept)
+
+    def _unique_conformers(self, scored_pop):
+        """Keep the lowest-energy conformer of each dihedral neighborhood."""
+        kept = []
+        for energy, coords, origin in scored_pop:
+            if any(self.dihedral_rmsd(coords, previous) < self.prune_rms_thresh
+                   for _, previous, _ in kept):
+                continue
+            kept.append((energy, coords, origin))
+        if not kept:
+            raise ValueError("Uniqueness filter removed every conformer")
+        return kept
+
+    def _breed(self, carried, gen: int):
+        requested = self.pop_size
+        population = self.reproduce(carried, requested)
+        if len(population) < requested:
+            rejected = self.population_generator.rejected_rmsd
+            if rejected is None or not np.isfinite(rejected):
+                raise ValueError("Population shrank without a rejected dihedral RMSD")
+            self.pop_size = len(population)
+            self._report(
+                f"Gen {gen}: kept {len(population)} of {requested} conformers; "
+                f"the next candidate dihedral RMSD was {rejected:.4f} degrees, "
+                f"below prune_rms_thresh {self.prune_rms_thresh}. "
+                f"Population size is now {self.pop_size}."
+            )
+        return population
 
     def _publish_energy_chart(self) -> None:
         if not self.energy_history:
@@ -512,7 +556,7 @@ class BaseGA:
         self._report(f"Population:     {self.pop_size}")
         self._report(f"Generations:    {self.generations}")
         self._report(f"Mutation Rate:  {self.mutation_rate}")
-        self._report(f"Crossover Rate: {self.crossover_rate}")
+        self._report(f"Crossover Rate: {1 - self.mutation_rate}")
         self._report(f"Dihedral Step:  {self.dihedral_interval}")
         self._report(f"Evaluator:      {type(self.evaluator).__name__} (Max Iters: {self.max_iters})")
         self._report(f"Parallel children: {self.parallel_children}")
@@ -553,36 +597,43 @@ class BaseGA:
 
         t1 = time.perf_counter()
         for gen in range(start_gen, self.generations + 1):
-            pop_coords = [ind for ind, _ in population]
-            scored_pop = self.evaluate_population(pop_coords)
-            if len(scored_pop) != len(population):
-                raise ValueError(
-                    f"Evaluator returned {len(scored_pop)} energies for {len(population)} individuals"
-                )
-            energies = [energy for energy, _ in scored_pop]
-            scored_coords = [ind for _, ind in scored_pop]
+            pending = [index for index, (_, _, energy) in enumerate(population) if energy is None]
+            if pending:
+                scored_pop = self.evaluate_population([population[index][0] for index in pending])
+                if len(scored_pop) != len(pending):
+                    raise ValueError(
+                        f"Evaluator returned {len(scored_pop)} energies for {len(pending)} individuals"
+                    )
+                for index, (energy, coords) in zip(pending, scored_pop):
+                    if energy is None or not np.isfinite(energy):
+                        raise ValueError("Population conformer has no finite energy")
+                    population[index] = (coords, population[index][1], float(energy))
+            energies = []
+            scored_coords = []
+            for coords, _, energy in population:
+                if energy is None or not np.isfinite(energy):
+                    raise ValueError("Population conformer has no finite energy")
+                energies.append(energy)
+                scored_coords.append(coords)
             self._record_energy_iteration(gen, energies)
             self._publish_energy_chart()
             self._publish_energy_histogram(energies)
             self._publish_diversity_chart(scored_coords)
             self._persist_live_artifacts()
-            # Re-attach labels
-            scored_with_labels = [(scored_pop[i][0], scored_pop[i][1], population[i][1]) for i in
-                                  range(len(population))]
+            scored_with_labels = [(energy, coords, origin) for coords, origin, energy in population]
             population = self.selection(scored_with_labels, gen)
-            self.post_generation_hook([ind for ind, _ in population], gen)
+            self.post_generation_hook([coords for coords, _, _ in population], gen)
 
             # Save state at the end of each generation (or every n generations)
             if gen != 0 and gen % 5 == 0 or gen == self.generations:
                 self.save_state(population, gen)
 
         self.timing["GA Loop"] = time.perf_counter() - t1
-        molecules = self.finalize([ind for ind, _ in population])
+        molecules = self.finalize(population)
         returned = list(molecules)
-        expected = min(self.pop_size, self.num_confs)
-        if len(returned) != expected:
+        if not 1 <= len(returned) <= self.num_confs:
             raise ValueError(
-                f"Expected {expected} population molecules, got {len(returned)}"
+                f"Expected between 1 and {self.num_confs} population molecules, got {len(returned)}"
             )
         self._publish_run_report(returned)
         return molecules
@@ -591,26 +642,25 @@ class BaseGA:
             self,
             scored_pop: List[Tuple[float, InternalCoordinatesList, str]],
             gen: int
-    ) -> List[Tuple[InternalCoordinatesList, str]]:
+    ):
         scored_pop.sort(key=lambda x: x[0])
-        # Track survival
         elite_size = max(1, int(self.pop_size * 0.2))
         elite_count = min(len(scored_pop), elite_size)
         for index, (_, _, origin) in enumerate(scored_pop):
             self._count_origin(origin, elite=index < elite_count)
 
-        best_individuals = [(ind, origin) for _, ind, origin in scored_pop[:elite_size]]
-        return self.reproduce(best_individuals, self.pop_size)
+        carried = [
+            (coords, origin, energy)
+            for energy, coords, origin in self._unique_conformers(scored_pop)[:elite_size]
+        ]
+        return self._breed(carried, gen)
 
     def post_generation_hook(self, population: List[InternalCoordinatesList], gen: int):
         pass
 
-    def finalize(self, population: List[InternalCoordinatesList]) -> MoleculeList:
+    def finalize(self, population) -> MoleculeList:
         t2 = time.perf_counter()
-        # Final evaluation of the last population
-        self.evaluate_population(population)
-        # Keep Cartesian optimization results; torsions cannot encode relaxed
-        # bond lengths and angles.
+        self.evaluate_population([coords for coords, _, _ in population])
         final_ranked = self._ranked_population(self.evaluated_molecules)
 
         self.timing["Finalization"] = time.perf_counter() - t2
@@ -629,8 +679,8 @@ class BaseGA:
 class StandardGA(BaseGA):
     """Score generated geometries; optimize only the final population."""
 
-    def finalize(self, population: List[InternalCoordinatesList]) -> MoleculeList:
-        molecules = [self.molecule_from_coordinates(ind) for ind in population]
+    def finalize(self, population) -> MoleculeList:
+        molecules = [self.molecule_from_coordinates(coords) for coords, _, _ in population]
         optimized = self.evaluate_molecules(molecules, optimize=True)
         if optimized:
             self.best_energy_seen = min(m.properties["energy"] for m in optimized)
@@ -639,6 +689,10 @@ class StandardGA(BaseGA):
 
 class MinimizingGA(BaseGA):
     """Relax every generation through the selected molecule evaluator."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.relaxed = {}
 
     def evaluate_population(self, population: List[InternalCoordinatesList]) -> List[Tuple[float, InternalCoordinatesList]]:
         molecules = [self.molecule_from_coordinates(ind) for ind in population]
@@ -668,15 +722,36 @@ class MinimizingGA(BaseGA):
         if optimized:
             self.best_energy_seen = min(self.best_energy_seen,
                                        min(m.properties["energy"] for m in optimized))
-        return [(mol.properties["energy"], self.coordinates_from_molecule(mol))
-                for mol in optimized]
+        paired = []
+        for molecule in optimized:
+            coords = self.coordinates_from_molecule(molecule)
+            self.relaxed[id(coords)] = molecule
+            paired.append((float(molecule.properties["energy"]), coords))
+        return paired
+
+    def finalize(self, population) -> MoleculeList:
+        pending = [index for index, (_, _, energy) in enumerate(population) if energy is None]
+        if pending:
+            scored = self.evaluate_population([population[index][0] for index in pending])
+            if len(scored) != len(pending):
+                raise ValueError(
+                    f"Evaluator returned {len(scored)} energies for {len(pending)} individuals"
+                )
+            for index, (energy, coords) in zip(pending, scored):
+                population[index] = (coords, population[index][1], float(energy))
+        molecules = []
+        for coords, _, _ in population:
+            molecule = self.relaxed.get(id(coords))
+            if molecule is None:
+                raise ValueError("Minimizing GA is missing the relaxed geometry for a carried conformer")
+            molecules.append(molecule)
+        return self._ranked_population(molecules)
 
 
 class DiversityGA(BaseGA):
-    def __init__(self, *args, n_prune: int = 10, prune_rms_thresh: float = 0.1, **kwargs):
+    def __init__(self, *args, n_prune: int = 10, **kwargs):
         super().__init__(*args, **kwargs)
         self.n_prune = n_prune
-        self.prune_rms_thresh = prune_rms_thresh
         self.rmsd_history = []
         if n_prune < 1:
             raise ValueError("n_prune must be positive")
@@ -685,80 +760,72 @@ class DiversityGA(BaseGA):
             self,
             scored_pop: List[Tuple[float, InternalCoordinatesList, str]],
             gen: int
-    ) -> List[Tuple[InternalCoordinatesList, str]]:
+    ):
         if not scored_pop:
             raise RuntimeError("DiversityGA.selection received an empty population.")
 
-        # Track survival to elite (top 20%)
         scored_pop.sort(key=lambda x: x[0])
         elite_size = min(len(scored_pop), max(1, int(self.pop_size * 0.2)))
         for index, (_, _, origin) in enumerate(scored_pop):
             self._count_origin(origin, elite=index < elite_size)
 
-        # 1. Keep the low-energy candidates according to the selected backend
-        min_energy = min(scored_pop, key=lambda x: x[0])[0]
+        min_energy = scored_pop[0][0]
         threshold = min_energy + 0.1 * abs(min_energy)
-        accepted = [ind for eng, ind, origin in scored_pop if eng <= threshold]
+        accepted = [item for item in scored_pop if item[0] <= threshold]
         if not accepted:
-            accepted = [min(scored_pop, key=lambda x: x[0])[1]]
+            accepted = [scored_pop[0]]
+        unique = self._unique_conformers(accepted)
+        if len(unique) > self.pop_size:
+            selected_indices = [0]
+            remaining = list(range(1, len(unique)))
+            rejected_rmsd = None
+            while remaining and len(selected_indices) < self.pop_size:
+                distances = [
+                    min(
+                        self.dihedral_rmsd(unique[candidate][1], unique[chosen][1])
+                        for chosen in selected_indices
+                    )
+                    for candidate in remaining
+                ]
+                best = int(np.argmax(distances))
+                if distances[best] < self.prune_rms_thresh:
+                    rejected_rmsd = float(distances[best])
+                    break
+                selected_indices.append(remaining.pop(best))
+            selected = [unique[index] for index in selected_indices]
+            if len(selected) < self.pop_size:
+                if rejected_rmsd is None or not np.isfinite(rejected_rmsd):
+                    raise ValueError("Population shrank without a rejected dihedral RMSD")
+                requested = self.pop_size
+                self.pop_size = len(selected)
+                self._report(
+                    f"Gen {gen}: kept {len(selected)} of {requested} conformers; "
+                    f"the next candidate dihedral RMSD was {rejected_rmsd:.4f} degrees, "
+                    f"below prune_rms_thresh {self.prune_rms_thresh}. "
+                    f"Population size is now {self.pop_size}."
+                )
+            new_population = [(coords, origin, energy) for energy, coords, origin in selected]
+        else:
+            carried = [(coords, origin, energy) for energy, coords, origin in unique]
+            new_population = self._breed(carried, gen)
 
-        # 2. Generate a new population with 2x the size of the accepted population
-        doubled_population = self.reproduce([(ind, "ga-select") for ind in accepted], 2 * self.pop_size)
-        doubled_population = [ind for ind, origin in doubled_population]
-
-        # 3. Score the doubled population for diversity
-        doubled_arr = np.array([
-            [c.get_actual_value(c.value) for c in ind.elements]
-            for ind in doubled_population
-        ])
-        diversity_scores = self.get_pairwise_rmsd_scores(doubled_arr)
-
-        # 4. Sort by diversity and take top 50%
-        # We use a greedy MaxMin approach to select a diverse subset.
-        selected_indices = [0]  # Start with the first one (arbitrary)
-        remaining_indices = list(range(1, len(doubled_population)))
-        target_size = int(len(doubled_population) * 0.5)
-
-        # Pre-calculate full distance matrix for the doubled population
-        data = np.deg2rad(doubled_arr)
-        diffs = data[:, np.newaxis, :] - data[np.newaxis, :, :]
-        diffs = (diffs + np.pi) % (2 * np.pi) - np.pi
-        dist_matrix = np.sqrt(np.mean(np.square(np.rad2deg(diffs)), axis=-1))
-
-        while len(selected_indices) < target_size:
-            # For each remaining individual, find its distance to the closest selected individual
-            min_dists = np.min(dist_matrix[remaining_indices][:, selected_indices], axis=1)
-            # Pick the one that has the largest such minimum distance
-            best_idx_in_remaining = np.argmax(min_dists)
-            selected_indices.append(remaining_indices.pop(best_idx_in_remaining))
-
-        selected_individuals = [doubled_population[i] for i in selected_indices]
-
-        # 5. Attach "ga-select" origin label to selected individuals
-        new_population = [(ind, "ga-select") for ind in selected_individuals]
-
-        # 6. Statistics for plotting
-        new_pop_coords = [ind for ind, origin in new_population]
-        new_pop_arr = np.array([
-            [c.get_actual_value(c.value) for c in ind.elements]
-            for ind in new_pop_coords
-        ])
-        after_scores = self.get_pairwise_rmsd_scores(new_pop_arr)
+        before_scores = self.get_pairwise_rmsd_scores([coords for _, coords, _ in accepted])
+        after_scores = self.get_pairwise_rmsd_scores([coords for coords, _, _ in new_population])
         self.rmsd_history.append({
             "gen": gen,
-            "high_before": float(np.max(diversity_scores)) if len(diversity_scores) > 0 else 0.0,
-            "low_before": float(np.min(diversity_scores)) if len(diversity_scores) > 0 else 0.0,
+            "high_before": float(np.max(before_scores)) if len(before_scores) > 0 else 0.0,
+            "low_before": float(np.min(before_scores)) if len(before_scores) > 0 else 0.0,
             "high_after": float(np.max(after_scores)) if len(after_scores) > 0 else 0.0,
-            "low_after": float(np.min(after_scores)) if len(after_scores) > 0 else 0.0
+            "low_after": float(np.min(after_scores)) if len(after_scores) > 0 else 0.0,
         })
-
-        output = (
+        self._report(
             f"Gen {gen:3d} | "
-            f"RMSD before [low={np.min(diversity_scores) if len(diversity_scores) > 0 else 0:8.4f}, high={np.max(diversity_scores) if len(diversity_scores) > 0 else 0:8.4f}] | "
-            f"after [low={np.min(after_scores) if len(after_scores) > 0 else 0:8.4f}, high={np.max(after_scores) if len(after_scores) > 0 else 0:8.4f}] | "
+            f"RMSD before [low={np.min(before_scores) if len(before_scores) > 0 else 0:8.4f}, "
+            f"high={np.max(before_scores) if len(before_scores) > 0 else 0:8.4f}] | "
+            f"after [low={np.min(after_scores) if len(after_scores) > 0 else 0:8.4f}, "
+            f"high={np.max(after_scores) if len(after_scores) > 0 else 0:8.4f}] | "
             f"Min energy = {min_energy:10.4f}, Acc = {len(accepted):3d}"
         )
-        self._report(output)
         return new_population
 
     def get_pairwise_rmsd_scores(self, pop: Union[np.ndarray, List[InternalCoordinatesList]]) -> np.ndarray:
@@ -873,9 +940,11 @@ class DiversityGA(BaseGA):
                 for atom in mol.atoms:
                     f.write(f"{atom.element} {atom.x:10.5f} {atom.y:10.5f} {atom.z:10.5f}\n")
 
-    def finalize(self, population: List[InternalCoordinatesList]) -> MoleculeList:
+    def finalize(self, population) -> MoleculeList:
         if not self.best_stored or self.generations % self.n_prune != 0:
-            self.post_generation_hook(population, self.generations, force_prune=True)
+            self.post_generation_hook(
+                [coords for coords, _, _ in population], self.generations, force_prune=True,
+            )
 
         output_prefix = f"{self.__class__.__name__.lower()}"
         plot_conformer_diversity(self.best_stored, output_prefix=output_prefix)

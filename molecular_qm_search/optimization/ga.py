@@ -5,7 +5,7 @@ from simstack.core.simstack_result import SimstackResult
 
 from molecular_qm_models import MoleculeList
 
-from molecular_qm_search.optimization.models.ga_models import GAConfig
+from molecular_qm_search.optimization.models.ga_models import GAConfig, GAMode
 from molecular_qm_search.optimization.lib.ga_evaluation import make_evaluator
 from .ga_method import (
     generate_ga_conformers,
@@ -49,11 +49,11 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
         node_runner.log(start_message)
     node_runner.info(start_message)
 
-    if config.mode == "ga":
+    if config.mode == GAMode.GA:
         gen_func = generate_ga_conformers
-    elif config.mode == "ga-min":
+    elif config.mode == GAMode.GA_MIN:
         gen_func = generate_ga_min_conformers
-    elif config.mode == "ga-select":
+    elif config.mode == GAMode.GA_SELECT:
         gen_func = generate_ga_select_conformers
     else:
         raise ValueError(f"Unknown GA mode: {config.mode!r}")
@@ -67,10 +67,9 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
             loop=asyncio.get_running_loop(), node_kwargs=kwargs,
         )
 
-    extra_args = {}
-    if config.mode == "ga-select":
+    extra_args = {"prune_rms_thresh": config.prune_rms_thresh}
+    if config.mode == GAMode.GA_SELECT:
         extra_args["n_prune"] = config.n_prune
-        extra_args["prune_rms_thresh"] = config.prune_rms_thresh
 
     ranked = await asyncio.to_thread(
         gen_func,
@@ -79,7 +78,6 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
         pop_size=config.pop_size,
         generations=config.generations,
         mutation_rate=config.mutation_rate,
-        crossover_rate=config.crossover_rate,
         dihedral_interval=config.dihedral_interval,
         seed=config.seed,
         max_iters=config.max_iters,

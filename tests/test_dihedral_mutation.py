@@ -98,23 +98,23 @@ def test_test1_mutation_and_crossover_generate_new_molecules():
     )
     mutator = PopulationGenerator(
         molecule, coordinates=coordinates, seed=2,
-        mutation_rate=1.0, crossover_rate=0.0, dihedral_interval=60.0,
+        mutation_rate=1.0, dihedral_interval=60.0,
     )
     parents = mutator.generate(5)
-    mutated = mutator.reproduce(parents, 9)
-    assert [origin for _, origin in mutated[:5]] == ["initial"] * 5
-    assert all(origin.startswith("mutation-") for _, origin in mutated[5:])
+    mutated = mutator.reproduce(parents, 9, 0.1)
+    assert [item[1] for item in mutated[:5]] == ["initial"] * 5
+    assert all(item[1].startswith("mutation-") for item in mutated[5:])
 
-    parent_angles = [_dihedral_angles(individual) for individual, _ in parents]
+    parent_angles = [_dihedral_angles(individual) for individual, *_ in parents]
     parent_positions = []
-    for individual, _ in parents:
+    for individual, *_ in parents:
         built = _geometry_matches_dihedrals(mutator, individual)
         parent_positions.append(_positions(built))
     assert _rmsd(parent_positions[0], original) < 1e-8
     assert sum(_rmsd(positions, original) > 0.5 for positions in parent_positions[1:]) >= 3
 
     mutated_positions = []
-    for individual, origin in mutated[5:]:
+    for individual, origin, *_ in mutated[5:]:
         donor = None
         for angles in parent_angles:
             deltas = [
@@ -131,15 +131,15 @@ def test_test1_mutation_and_crossover_generate_new_molecules():
 
     crosser = PopulationGenerator(
         molecule, coordinates=coordinates, seed=7,
-        mutation_rate=0.0, crossover_rate=1.0, dihedral_interval=60.0,
+        mutation_rate=0.0, dihedral_interval=60.0,
     )
-    crossed = crosser.reproduce(parents, 10)
-    assert [origin for _, origin in crossed[:5]] == ["initial"] * 5
-    assert [origin for _, origin in crossed[5:]] == ["crossover"] * 5
+    crossed = crosser.reproduce(parents, 10, 0.1)
+    assert [item[1] for item in crossed[:5]] == ["initial"] * 5
+    assert [item[1] for item in crossed[5:]] == ["crossover"] * 5
 
     novel_crossover = False
     crossover_positions = []
-    for individual, _ in crossed[5:]:
+    for individual, *_ in crossed[5:]:
         child_angles = _dihedral_angles(individual)
         splice = _crossover_splice(child_angles, parent_angles)
         assert splice is not None

@@ -84,7 +84,7 @@ def test_generation_is_reproducible_and_does_not_modify_inputs(molecule, coordin
     first = PopulationGenerator(molecule, coordinates=coordinates, seed=5)
     second = PopulationGenerator(molecule, coordinates=coordinates, seed=5)
     pop1, pop2 = first.generate(5), second.generate(5)
-    assert [p.elements[0].value for p, _ in pop1] == [p.elements[0].value for p, _ in pop2]
+    assert [p.elements[0].value for p, *_ in pop1] == [p.elements[0].value for p, *_ in pop2]
     before = copy.deepcopy(pop1[1][0])
     result = first.molecule_from_coordinates(pop1[1][0])
     assert result is not molecule
@@ -97,9 +97,9 @@ def test_generation_is_reproducible_and_does_not_modify_inputs(molecule, coordin
 def test_double_bond_mutation_flips_relative_to_parent(molecule, coordinates):
     coordinates.elements[0].bond_type = InternalCoordinateBondType.DOUBLE
     generator = PopulationGenerator(molecule, coordinates=coordinates, mutation_rate=1,
-                                    crossover_rate=0, dihedral_interval=0)
+                                    dihedral_interval=0)
     parents = generator.generate(1)
-    offspring = generator.reproduce(parents, 2)
+    offspring = generator.reproduce(parents, 2, 0.1)
     before = parents[0][0].elements[0].value
     after = offspring[1][0].elements[0].value
     assert (after - before) % 1 == pytest.approx(0.5)
@@ -112,7 +112,8 @@ def test_modes_use_injected_backend_and_preserve_final_geometry(
     monkeypatch.chdir(tmp_path)
     evaluator = Evaluator()
     ga = ga_class(molecule, logging.getLogger("test"), evaluator=evaluator,
-                  coordinates=coordinates, pop_size=3, num_confs=2, generations=1)
+                  coordinates=coordinates, pop_size=3, num_confs=2, generations=1,
+                  mutation_rate=1.0)
     ga.setup()
     assert evaluator.calls == []
     result = ga.run()
@@ -141,7 +142,7 @@ def test_smart_optimization_preserves_order_and_partial_results(molecule, coordi
     ga.setup()
     decisions = iter([True, False, True])
     ga.smart_optimizer.should_discard = lambda *args: next(decisions)
-    population = [ind for ind, _ in ga.population_generator.generate(3)]
+    population = [ind for ind, *_ in ga.population_generator.generate(3)]
     assert len(ga.evaluate_population(population)) == 3
     assert evaluator.calls == [("score", 3), ("optimize", 3, 10), ("optimize", 1, 100)]
     assert len(ga.evaluated_molecules) == 3
@@ -193,7 +194,7 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
     runner = RecordingRunner()
     ga = StandardGA(
         molecule, runner, evaluator=DistinctGeometryEvaluator(), coordinates=coordinates,
-        pop_size=12, num_confs=6, generations=2, mutation_rate=1.0, crossover_rate=0.5, seed=1,
+        pop_size=12, num_confs=6, generations=2, mutation_rate=1.0, seed=1,
     )
     conformers = ga.run()
     assert len(conformers) == 6
@@ -209,7 +210,7 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
     assert table.heading == ["change", "produced", "elite_survivors", "success_rate"]
     changes = [row["change"] for row in table.row]
     assert "initial" in changes
-    assert "crossover" in changes
+    assert "copy" not in changes
     assert any(change.startswith("mutation-") for change in changes)
     for row in table.row:
         assert 0 <= row["success_rate"] <= 1
@@ -304,6 +305,7 @@ def test_energy_plot_drops_iterations_until_range_settles(molecule, coordinates,
     ga = StandardGA(
         molecule, runner, evaluator=SpreadEvaluator([100.0, 80.0, 10.0, 8.0]),
         coordinates=coordinates, pop_size=4, num_confs=4, generations=3, seed=1,
+        mutation_rate=1.0,
     )
     ga.run()
     assert [row["iteration"] for row in runner.energy_chart.data] == [2, 3]
@@ -312,7 +314,8 @@ def test_energy_plot_drops_iterations_until_range_settles(molecule, coordinates,
 
 def test_restart_restores_generator_random_state(molecule, coordinates, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    ga = StandardGA(molecule, logging.getLogger("test"), evaluator=Evaluator(), coordinates=coordinates)
+    ga = StandardGA(molecule, logging.getLogger("test"), evaluator=Evaluator(),
+                    coordinates=coordinates, mutation_rate=1.0)
     ga.setup()
     population = ga.population_generator.generate(4)
     ga.save_state(population, 2)
@@ -320,7 +323,90 @@ def test_restart_restores_generator_random_state(molecule, coordinates, tmp_path
     restored, generation = ga.load_state()
     actual = ga.reproduce(restored[:1], 4)
     assert generation == 2
-    assert [p.elements[0].value for p, _ in actual] == [p.elements[0].value for p, _ in expected]
+    assert [p.elements[0].value for p, *_ in actual] == [p.elements[0].value for p, *_ in expected]
+
+
+def test_later_generations_score_only_new_conformers(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    evaluator = Evaluator()
+    ga = StandardGA(
+        molecule, logging.getLogger("test"), evaluator=evaluator, coordinates=coordinates,
+        pop_size=5, num_confs=5, generations=1, mutation_rate=1.0, dihedral_interval=40,
+    )
+    ga.run()
+    score_sizes = [call[1] for call in evaluator.calls if call[0] == "score"]
+    assert score_sizes == [5, 4]
+
+
+def test_noop_mutations_shrink_the_population_and_warn(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runner = RecordingRunner()
+    ga = StandardGA(
+        molecule, runner, evaluator=Evaluator(), coordinates=coordinates,
+        pop_size=4, num_confs=4, generations=0, mutation_rate=1.0, dihedral_interval=0,
+    )
+    result = list(ga.run())
+    assert ga.pop_size == 1
+    assert len(result) == 1
+    assert "Population size is now 1" in runner.log_string
+    assert "below prune_rms_thresh" in runner.log_string
+
+
+def test_crossover_requires_two_parents(molecule, coordinates):
+    generator = PopulationGenerator(molecule, coordinates=coordinates, mutation_rate=0)
+    with pytest.raises(ValueError, match="two parents"):
+        generator.reproduce(generator.generate(1), 2, 0.1)
+
+
+def test_non_positive_prune_threshold_is_rejected(molecule, coordinates):
+    with pytest.raises(ValueError, match="prune_rms_thresh"):
+        StandardGA(molecule, logging.getLogger("test"), coordinates=coordinates, prune_rms_thresh=0)
+
+
+def test_checkpoint_without_energies_is_rejected(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    ga = StandardGA(molecule, logging.getLogger("test"), evaluator=Evaluator(), coordinates=coordinates)
+    ga.setup()
+    population = [(coords, "initial") for coords, *_ in ga.population_generator.generate(2)]
+    ga.save_state(population, 1)
+    with pytest.raises(ValueError, match="no energies"):
+        ga.load_state()
+
+
+class CollapsingEvaluator:
+    def score(self, molecules):
+        return self.optimize(molecules, max_iters=1)
+
+    def optimize(self, molecules, *, max_iters):
+        template = Molecule.from_molecule(molecules[0])
+        results = []
+        for index, _molecule in enumerate(molecules):
+            result = Molecule.from_molecule(template)
+            result.properties["energy"] = float(index)
+            result.properties["energy_unit"] = "kcal/mol"
+            results.append(result)
+        return results
+
+
+def test_ga_min_keeps_one_conformer_from_one_basin(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    ga = MinimizingGA(
+        molecule, logging.getLogger("test"), evaluator=CollapsingEvaluator(), coordinates=coordinates,
+        pop_size=3, num_confs=3, generations=0, mutation_rate=1.0, dihedral_interval=0,
+    )
+    assert len(list(ga.run())) == 1
+
+
+def test_archive_drops_duplicate_dihedrals(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    ga = DiversityGA(
+        molecule, logging.getLogger("test"), evaluator=Evaluator(), coordinates=coordinates,
+        pop_size=2, num_confs=2, n_prune=1, mutation_rate=1.0,
+    )
+    ga.setup()
+    folded = copy.deepcopy(ga.template_coords)
+    ga.post_generation_hook([folded, copy.deepcopy(folded)], 1)
+    assert len(list(ga.best_stored)) == 1
 
 
 @pytest.mark.parametrize("ga_class", [StandardGA, MinimizingGA, DiversityGA])
@@ -329,7 +415,8 @@ def test_real_rdkit_ga_smoke(ga_class, tmp_path, monkeypatch):
 
     monkeypatch.chdir(tmp_path)
     ga = ga_class(smiles_to_molecule("CCCC"), logging.getLogger("test"),
-                  pop_size=3, num_confs=2, generations=0, parallel_children=1, max_iters=100)
+                  pop_size=3, num_confs=2, generations=0, parallel_children=1, max_iters=100,
+                  mutation_rate=1.0)
     result = list(ga.run())
     assert result
     rescored = score_molecules_rdkit(result, threads=1)

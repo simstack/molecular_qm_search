@@ -9,7 +9,12 @@ from simstack.tables import node_children
 from simstack.util.docstring_parser import DocstringParser
 
 from molecular_qm_models import Molecule, MoleculeList
-from molecular_qm_search.optimization.models.ga_models import GAConfig, GAOptimizationMethod
+from molecular_qm_search.optimization.models.ga_models import (
+    DoubleBondTreatment,
+    GAConfig,
+    GAMode,
+    GAOptimizationMethod,
+)
 
 CALCULATOR_NODES = {
     "dftb_list_calculator": "molecular_qm_dftb.nodes.dftb_list_calculator.dftb_list_calculator",
@@ -55,6 +60,8 @@ async def test_node_dispatches_modes_and_returns_molecule_list(monkeypatch, mode
     assert "threads" not in received[0]
     if mode == "ga-select":
         assert received[0]["n_prune"] == config.n_prune
+    assert received[0]["prune_rms_thresh"] == config.prune_rms_thresh
+    assert "crossover_rate" not in received[0]
 
 
 def test_config_uses_method_enum_and_exposes_rotatable_bond_options():
@@ -75,6 +82,13 @@ def test_config_uses_method_enum_and_exposes_rotatable_bond_options():
     assert schema["$defs"]["GAOptimizationMethod"]["enum"] == [
         "RDKIT/mmff", "RDKIT/mmff94s", "RDKIT/uff", "XTB", "DFTB",
     ]
+    assert schema["$defs"]["GAMode"]["enum"] == ["ga", "ga-min", "ga-select"]
+    assert schema["$defs"]["DoubleBondTreatment"]["enum"] == [
+        "ignore", "180+step", "treat-as-single",
+    ]
+    assert schema["properties"]["mode"]["title"] == "GA mode"
+    assert schema["properties"]["db_treatment"]["title"] == "Double bond treatment"
+    assert "crossover_rate" not in schema["properties"]
     assert schema["properties"]["parallel_children"]["title"] == "Parallel children"
     assert "match_double_bonds" in schema["properties"]
     assert "rotatable_bond_min" in schema["properties"]
@@ -83,14 +97,11 @@ def test_config_uses_method_enum_and_exposes_rotatable_bond_options():
         GAConfig(initial_molecule=Molecule(), optimization_method="mmff")
 
 
-@pytest.mark.asyncio
-async def test_node_rejects_unknown_mode():
-    module = importlib.import_module("molecular_qm_search.optimization.ga")
-    config = GAConfig(initial_molecule=Molecule(), mode="typo")
-    with pytest.raises(ValueError, match="Unknown GA mode"):
-        await module.run_ga_conformer_gen.__wrapped__(
-            config, node_runner=SimpleNamespace(info=lambda *a: None),
-        )
+def test_config_rejects_unknown_mode():
+    with pytest.raises(ValidationError):
+        GAConfig(initial_molecule=Molecule(), mode="typo")
+    assert GAConfig(initial_molecule=Molecule()).mode is GAMode.GA
+    assert GAConfig(initial_molecule=Molecule()).db_treatment is DoubleBondTreatment.STEP_180
 
 
 def test_node_documents_molecule_list_chart_and_statistics():

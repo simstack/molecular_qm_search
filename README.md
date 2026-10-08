@@ -10,9 +10,12 @@ The conformer GA operates on `Molecule`, `MoleculeList`, and
 `optimization.ga_population.PopulationGenerator` discovers torsions through
 `molecular_qm_util.get_rotatable_bonds`, or accepts an explicit
 `InternalCoordinatesList`. Discovery receives `match_double_bonds`,
-`rotatable_bond_min`, and `rotatable_bond_max`. `generate`, `reproduce`,
-`molecule_from_coordinates`, and `coordinates_from_molecule` methods never
-score or optimize a structure. Passing coordinates avoids RDKit torsion discovery.
+`rotatable_bond_min`, and `rotatable_bond_max`. `generate` builds the initial
+dihedral population. `reproduce` carries the selected parents once and appends
+only new conformers: a mutation with probability `mutation_rate`, otherwise a
+crossover of two parents. A child whose dihedral RMSD is below
+`prune_rms_thresh` (degrees) is discarded. Neither method scores or optimizes
+a structure. Passing coordinates avoids RDKit torsion discovery.
 Each generator owns its seeded random state; mutation does not modify parents.
 
 ## Evaluation and optimization
@@ -61,15 +64,16 @@ conformers = ga.run()
 ```
 
 `optimization_method` is `GAOptimizationMethod`: `RDKIT/mmff` (MMFF94),
-`RDKIT/mmff94s`, `RDKIT/uff`, `XTB`, or `DFTB`. `parallel_children` is the
-number of evaluations to run together. A supplied `evaluator` takes
-precedence. Unsupported methods raise.
+`RDKIT/mmff94s`, `RDKIT/uff`, `XTB`, or `DFTB`. `parallel_children` is the RDKit force-field
+thread count. `0` leaves RDKit's own default. DFTB and xTB evaluate each batch
+as one SimStack child node, so this count is not forwarded to those calculators.
+A supplied `evaluator` takes precedence. Unsupported methods raise.
 
 `run_ga_conformer_gen(GAConfig(...))` provides the SimStack node entry point.
 It returns the final population as `node_runner.molecules` (`MoleculeList`),
 an energy chart of minimum and maximum energy versus iteration, a histogram of
-those energies, and a table of elite-survival success rates for crossover,
-copy, and mutation by bond type.
+those energies, and a table of elite-survival success rates for crossover
+and mutation by bond type.
 It runs the synchronous GA in a
 worker thread while quantum calculations execute on the parent event loop.
 For direct use from an async workflow, construct the quantum evaluator with
@@ -77,16 +81,49 @@ For direct use from an async workflow, construct the quantum evaluator with
 
 ## GA modes
 
-- `ga`: score each generation, then optimize the final population.
-- `ga-min`: optimize each generation; optional smart optimization scores the
-  starting batch, partially relaxes it, and fully relaxes selected candidates.
-- `ga-select`: filter with the selected backend's energy, select torsional
-  diversity, and periodically optimize and prune candidates. This replaces the
-  previous hard-coded Lennard-Jones prefilter.
+`GAMode` selects the search. The form shows it as a dropdown.
 
-Setup performs no initial optimization. Rigid molecules are optimized once by
-the selected evaluator. Existing selection, Cartesian pruning and checkpoint
-behavior remain; checkpoints also store the generator's random state.
+- `ga` (`StandardGA`): each generation builds Cartesian geometries from the
+  dihedral chromosomes and scores them. Parents that already have an energy are
+  not scored again. After the last generation the carried population is
+  optimized once, and the lowest-energy unique conformers are returned, at most
+  `num_confs`.
+- `ga-min` (`MinimizingGA`): each new conformer is optimized, and the relaxed
+  dihedrals replace the chromosome. Carried conformers are not optimized again.
+  Optional smart optimization scores the new batch, partially relaxes it, and
+  fully relaxes the candidates it keeps. The returned geometries are those
+  relaxed structures.
+- `ga-select` (`DiversityGA`): breeding uses the same score-only evaluation as
+  `ga`. The next generation keeps the low-energy conformers that are at least
+  `prune_rms_thresh` degrees apart. When more than `pop_size` qualify, MaxMin
+  keeps a diverse subset. Every `n_prune` generations the current population is
+  optimized and merged into an archive (`best_stored`). The archive also
+  updates on the first generation, because it starts empty, and once more at
+  the end if that generation was not already a prune generation. The archive is
+  the returned population: lowest energy first, duplicates removed, at most
+  `num_confs`.
+
+`n_prune` has no effect on `ga` or `ga-min`.
+
+In every mode the lowest-energy 20 percent (`ga`, `ga-min`) or the
+energy-window survivors (`ga-select`) are carried once. Open slots are filled
+with a mutation or a crossover. There is no copy operator and no separate
+crossover-rate input: the crossover probability is `1 - mutation_rate`.
+`mutation_rate` of 0 is all crossover, and crossover with fewer than two
+parents raises. A proposed child closer than `prune_rms_thresh` (default 0.1
+degrees) to a conformer already kept is dropped. After `pop_size` such
+rejections in a row the population shrinks to the number kept and the node log
+records the generation, the requested size, the kept size, and the rejected
+RMSD.
+
+`db_treatment` is a dropdown for rotatable double bonds: `ignore` drops them,
+`180+step` adds 180 degrees to each double-bond mutation, and `treat-as-single`
+mutates them like single bonds.
+
+Setup performs no initial optimization. A molecule with no rotatable bonds is
+optimized once by the selected evaluator. Checkpoints store the generator's
+random state and the energy of each carried conformer. A checkpoint whose
+population has no energy slot raises.
 
 ## Tests
 
