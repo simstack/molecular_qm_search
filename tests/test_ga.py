@@ -302,14 +302,18 @@ class SpreadEvaluator:
 def test_energy_plot_drops_iterations_until_range_settles(molecule, coordinates, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     runner = RecordingRunner()
+    # 200 -> 8 exceeds a factor of 10 and would drop the first two iterations.
+    # 7 -> 0.4 would drop everything before the last two; the plot still keeps 10.
+    spans = [200.0, 180.0, 8.0] + [7.0] * 7 + [0.4, 0.4]
     ga = StandardGA(
-        molecule, runner, evaluator=SpreadEvaluator([100.0, 80.0, 10.0, 8.0]),
-        coordinates=coordinates, pop_size=4, num_confs=4, generations=3, seed=1,
+        molecule, runner, evaluator=SpreadEvaluator(spans),
+        coordinates=coordinates, pop_size=4, num_confs=4, generations=len(spans) - 1, seed=1,
         mutation_rate=1.0,
     )
     ga.run()
-    assert [row["iteration"] for row in runner.energy_chart.data] == [2, 3]
+    assert [row["iteration"] for row in runner.energy_chart.data] == list(range(2, len(spans)))
     assert "Dropped 2 initial iterations" in runner.log_string
+    assert "factor of 10" in runner.log_string
 
 
 def test_restart_restores_generator_random_state(molecule, coordinates, tmp_path, monkeypatch):
@@ -349,7 +353,26 @@ def test_noop_mutations_shrink_the_population_and_warn(molecule, coordinates, tm
     assert ga.pop_size == 1
     assert len(result) == 1
     assert "Population size is now 1" in runner.log_string
-    assert "below prune_rms_thresh" in runner.log_string
+    assert "did not move a dihedral" in runner.log_string
+    assert "rejected 4 with no dihedral change" in runner.log_string
+    assert "Conformer prune:" in runner.log_string
+    assert "does not store every dihedral combination" in runner.log_string
+
+
+def test_wide_rmsd_threshold_drops_conformers_and_says_so(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runner = RecordingRunner()
+    ga = StandardGA(
+        molecule, runner, evaluator=Evaluator(), coordinates=coordinates,
+        pop_size=4, num_confs=4, generations=0, mutation_rate=1.0,
+        dihedral_interval=40, prune_rms_thresh=360, seed=1,
+    )
+    result = list(ga.run())
+    assert len(result) == 1
+    assert ga.pop_size == 1
+    assert "dropped 3 with dihedral RMSD below prune_rms_thresh 360" in runner.log_string
+    assert "rejected 4 below prune_rms_thresh" in runner.log_string
+    assert "nearest" in runner.log_string
 
 
 def test_crossover_requires_two_parents(molecule, coordinates):
@@ -411,7 +434,7 @@ def test_archive_drops_duplicate_dihedrals(molecule, coordinates, tmp_path, monk
 
 @pytest.mark.parametrize("ga_class", [StandardGA, MinimizingGA, DiversityGA])
 def test_real_rdkit_ga_smoke(ga_class, tmp_path, monkeypatch):
-    from molecular_qm_util import smiles_to_molecule, score_molecules_rdkit
+    from molecular_qm_util import smiles_to_molecule, evaluate_molecules_rdkit
 
     monkeypatch.chdir(tmp_path)
     ga = ga_class(smiles_to_molecule("CCCC"), logging.getLogger("test"),
@@ -419,7 +442,7 @@ def test_real_rdkit_ga_smoke(ga_class, tmp_path, monkeypatch):
                   mutation_rate=1.0)
     result = list(ga.run())
     assert result
-    rescored = score_molecules_rdkit(result, threads=1)
+    rescored = evaluate_molecules_rdkit(result, threads=1)
     for final, checked in zip(result, rescored):
         # Stored energy belongs to the returned geometry. OpenBabel SDF
         # conversion rounds positions to four decimals on the second evaluation.

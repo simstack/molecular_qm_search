@@ -64,6 +64,8 @@ class PopulationGenerator:
         self.dihedral_interval = dihedral_interval
         self.db_treatment = db_treatment
         self.rejected_rmsd = None
+        self.last_rejection = None
+        self.reproduction_stats = None
 
     def molecule_from_coordinates(self, coordinates: InternalCoordinatesList) -> Molecule:
         result = self._copy_molecule(self.molecule)
@@ -115,10 +117,12 @@ class PopulationGenerator:
         """Carry parents once and append only new mutations or crossovers.
 
         Each parent is ``(coordinates, origin, energy)``. Added conformers have
-        energy ``None``. A proposal closer than ``prune_rms_thresh`` degrees to
-        a conformer already kept is discarded. After ``target_size`` discarded
-        proposals in a row, the returned population is shorter than requested
-        and ``rejected_rmsd`` is the last discarded distance.
+        energy ``None``. A proposal that does not move a dihedral, or whose
+        dihedral RMSD to a conformer already kept is below ``prune_rms_thresh``
+        degrees, is discarded. After ``target_size`` discarded proposals in a
+        row, the returned population is shorter than requested.
+        ``last_rejection`` is ``noop`` or ``rmsd``, and ``rejected_rmsd`` is the
+        last discarded distance (0 when the proposal did not move).
         """
         if not parents:
             raise ValueError("Cannot reproduce an empty population")
@@ -138,6 +142,13 @@ class PopulationGenerator:
                 raise ValueError("Parent conformers must carry coordinates, origin, and energy")
         population = list(parents)
         self.rejected_rmsd = None
+        self.last_rejection = None
+        self.reproduction_stats = {
+            "accepted": 0,
+            "rejected_rmsd": 0,
+            "rejected_noop": 0,
+            "closest_rejected_rmsd": None,
+        }
         rejected = 0
         n_coords = len(self.coordinates.elements)
         while len(population) < target_size:
@@ -176,8 +187,19 @@ class PopulationGenerator:
                     distance = min(dihedral_rmsd(child, kept[0]) for kept in population)
             if child is None or distance < prune_rms_thresh:
                 rejected += 1
-                self.rejected_rmsd = 0.0 if child is None else distance
+                if child is None:
+                    self.rejected_rmsd = 0.0
+                    self.last_rejection = "noop"
+                    self.reproduction_stats["rejected_noop"] += 1
+                else:
+                    self.rejected_rmsd = distance
+                    self.last_rejection = "rmsd"
+                    self.reproduction_stats["rejected_rmsd"] += 1
+                    closest = self.reproduction_stats["closest_rejected_rmsd"]
+                    if closest is None or distance < closest:
+                        self.reproduction_stats["closest_rejected_rmsd"] = distance
                 continue
             rejected = 0
+            self.reproduction_stats["accepted"] += 1
             population.append((child, origin, None))
         return population

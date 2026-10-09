@@ -261,43 +261,118 @@ class BaseGA:
         ranked = sorted(molecules, key=lambda molecule: float(molecule.properties["energy"]))
         kept = []
         kept_coords = []
+        nearest_dropped = None
+        examined = 0
         for molecule in ranked:
+            examined += 1
             coords = self.coordinates_from_molecule(molecule)
-            if any(self.dihedral_rmsd(coords, previous) < self.prune_rms_thresh for previous in kept_coords):
-                continue
+            if kept_coords:
+                distance = min(
+                    self.dihedral_rmsd(coords, previous) for previous in kept_coords
+                )
+                if distance < self.prune_rms_thresh:
+                    if nearest_dropped is None or distance < nearest_dropped:
+                        nearest_dropped = distance
+                    continue
             kept.append(molecule)
             kept_coords.append(coords)
             if len(kept) == self.num_confs:
                 break
         if not kept:
             raise ValueError("Final population is empty")
+        dropped = examined - len(kept)
+        unexamined = len(ranked) - examined
+        self._report(
+            f"Conformer prune: {len(ranked)} in, kept {len(kept)}, "
+            f"{self._dihedral_prune_phrase(dropped, nearest_dropped)}. "
+            f"Stopped at num_confs {self.num_confs}; "
+            f"{unexamined} higher-energy conformers were not compared."
+        )
         return _to_molecule_list(kept)
+
+    def _dihedral_prune_phrase(self, dropped: int, nearest) -> str:
+        if dropped == 0:
+            return (
+                f"dropped 0 with dihedral RMSD below prune_rms_thresh {self.prune_rms_thresh}"
+            )
+        if nearest is None or not np.isfinite(nearest):
+            raise ValueError("Dihedral RMSD prune dropped conformers without a distance")
+        return (
+            f"dropped {dropped} with dihedral RMSD below prune_rms_thresh {self.prune_rms_thresh} "
+            f"(nearest {float(nearest):.4f} degrees)"
+        )
+
+    def _children_phrase(self) -> str:
+        stats = self.population_generator.reproduction_stats
+        if not isinstance(stats, dict):
+            raise ValueError("Breeding finished without reproduction statistics")
+        for key in ("accepted", "rejected_rmsd", "rejected_noop", "closest_rejected_rmsd"):
+            if key not in stats:
+                raise ValueError(f"Reproduction statistics are missing {key}")
+        rejected_rmsd = stats["rejected_rmsd"]
+        if rejected_rmsd:
+            closest = stats["closest_rejected_rmsd"]
+            if closest is None or not np.isfinite(closest):
+                raise ValueError("RMSD rejections were counted without a distance")
+            rmsd_phrase = (
+                f"rejected {rejected_rmsd} below prune_rms_thresh "
+                f"(closest {float(closest):.4f} degrees)"
+            )
+        else:
+            rmsd_phrase = "rejected 0 below prune_rms_thresh"
+        return (
+            f"children accepted {stats['accepted']}, {rmsd_phrase}, "
+            f"rejected {stats['rejected_noop']} with no dihedral change"
+        )
 
     def _unique_conformers(self, scored_pop):
         """Keep the lowest-energy conformer of each dihedral neighborhood."""
         kept = []
+        nearest_dropped = None
         for energy, coords, origin in scored_pop:
-            if any(self.dihedral_rmsd(coords, previous) < self.prune_rms_thresh
-                   for _, previous, _ in kept):
-                continue
+            if kept:
+                distance = min(
+                    self.dihedral_rmsd(coords, previous) for _, previous, _ in kept
+                )
+                if distance < self.prune_rms_thresh:
+                    if nearest_dropped is None or distance < nearest_dropped:
+                        nearest_dropped = distance
+                    continue
             kept.append((energy, coords, origin))
         if not kept:
             raise ValueError("Uniqueness filter removed every conformer")
-        return kept
+        dropped = len(scored_pop) - len(kept)
+        if dropped and (nearest_dropped is None or not np.isfinite(nearest_dropped)):
+            raise ValueError("Uniqueness filter dropped conformers without a dihedral RMSD")
+        return kept, {
+            "kept": len(kept),
+            "dropped": dropped,
+            "nearest_dropped_rmsd": nearest_dropped,
+        }
 
     def _breed(self, carried, gen: int):
         requested = self.pop_size
         population = self.reproduce(carried, requested)
         if len(population) < requested:
-            rejected = self.population_generator.rejected_rmsd
-            if rejected is None or not np.isfinite(rejected):
-                raise ValueError("Population shrank without a rejected dihedral RMSD")
+            reason = self.population_generator.last_rejection
+            if reason == "noop":
+                detail = "the next candidate did not move a dihedral"
+            elif reason == "rmsd":
+                rejected = self.population_generator.rejected_rmsd
+                if rejected is None or not np.isfinite(rejected):
+                    raise ValueError("Population shrank without a rejected dihedral RMSD")
+                detail = (
+                    f"the next candidate dihedral RMSD was {rejected:.4f} degrees, "
+                    f"below prune_rms_thresh {self.prune_rms_thresh}"
+                )
+            else:
+                raise ValueError(
+                    f"Population shrank without a rejection reason, got {reason!r}"
+                )
             self.pop_size = len(population)
             self._report(
                 f"Gen {gen}: kept {len(population)} of {requested} conformers; "
-                f"the next candidate dihedral RMSD was {rejected:.4f} degrees, "
-                f"below prune_rms_thresh {self.prune_rms_thresh}. "
-                f"Population size is now {self.pop_size}."
+                f"{detail}. Population size is now {self.pop_size}."
             )
         return population
 
@@ -312,17 +387,26 @@ class BaseGA:
                     f"Iteration {point['iteration']} has an invalid energy range {span}"
                 )
             spans.append(span)
+        range_factor = 10
+        min_plotted_iterations = 10
         start = 0
         for index in range(len(spans) - 1):
             previous, current = spans[index], spans[index + 1]
             if previous == 0 and current == 0:
                 continue
-            if previous == 0 or current == 0 or max(previous, current) / min(previous, current) > 2:
+            if (
+                previous == 0
+                or current == 0
+                or max(previous, current) / min(previous, current) > range_factor
+            ):
                 start = index + 1
+        earliest_start = max(0, len(spans) - min_plotted_iterations)
+        if start > earliest_start:
+            start = earliest_start
         if start and start != self._energy_plot_start:
             self._report(
                 f"Dropped {start} initial iterations from the energy plot; "
-                "the min-max energy range changed by more than a factor of 2."
+                "the min-max energy range changed by more than a factor of 10."
             )
         self._energy_plot_start = start
         plotted_history = self.energy_history[start:]
@@ -571,6 +655,20 @@ class BaseGA:
             self._report(f"Prune Every:    {getattr(self, 'n_prune')}")
         if hasattr(self, "prune_rms_thresh"):
             self._report(f"Prune RMS:      {getattr(self, 'prune_rms_thresh')}")
+        self._report(
+            "Population evolution keeps at most pop_size conformers and returns at most "
+            f"num_confs ({self.num_confs}). It does not store every dihedral combination. "
+            "Each generation drops conformers within prune_rms_thresh "
+            f"({self.prune_rms_thresh} degrees dihedral RMSD) of a lower-energy survivor, "
+            "carries the lowest 20% (at least one) as parents, and replaces the rest with "
+            "children. A child that does not move a dihedral, or whose dihedral RMSD to a "
+            "kept conformer is below prune_rms_thresh, is rejected. After pop_size "
+            "rejections in a row, pop_size shrinks and does not grow back. "
+            "ga-min compares the optimized geometry, so distinct starts that relax into one "
+            "well are dropped by this RMSD test. ga-select also drops conformers above "
+            "min energy + 0.1*|min energy| before that RMSD prune. "
+            "The final list is pruned the same way and then cut at num_confs."
+        )
         self._report(f"Rotatable Bonds: {len(self.template_coords.elements)}")
         self._report(f"Dihedrals:       {self.dihedrals}")
         self._report(f"Dihedral Types:  {self.dihedral_types}")
@@ -649,11 +747,20 @@ class BaseGA:
         for index, (_, _, origin) in enumerate(scored_pop):
             self._count_origin(origin, elite=index < elite_count)
 
+        unique, prune = self._unique_conformers(scored_pop)
         carried = [
             (coords, origin, energy)
-            for energy, coords, origin in self._unique_conformers(scored_pop)[:elite_size]
+            for energy, coords, origin in unique[:elite_size]
         ]
-        return self._breed(carried, gen)
+        population = self._breed(carried, gen)
+        self._report(
+            f"Gen {gen}: scored {len(scored_pop)}; "
+            f"dihedral-RMSD prune kept {prune['kept']} and "
+            f"{self._dihedral_prune_phrase(prune['dropped'], prune['nearest_dropped_rmsd'])}; "
+            f"elite parents {len(carried)} of {prune['kept']}; "
+            f"{self._children_phrase()}; population {len(population)}."
+        )
+        return population
 
     def post_generation_hook(self, population: List[InternalCoordinatesList], gen: int):
         pass
@@ -774,7 +881,8 @@ class DiversityGA(BaseGA):
         accepted = [item for item in scored_pop if item[0] <= threshold]
         if not accepted:
             accepted = [scored_pop[0]]
-        unique = self._unique_conformers(accepted)
+        unique, prune = self._unique_conformers(accepted)
+        energy_dropped = len(scored_pop) - len(accepted)
         if len(unique) > self.pop_size:
             selected_indices = [0]
             remaining = list(range(1, len(unique)))
@@ -805,9 +913,23 @@ class DiversityGA(BaseGA):
                     f"Population size is now {self.pop_size}."
                 )
             new_population = [(coords, origin, energy) for energy, coords, origin in selected]
+            child_note = (
+                f"diversity selection kept {len(new_population)} of {len(unique)} unique "
+                "by dihedral separation"
+            )
         else:
             carried = [(coords, origin, energy) for energy, coords, origin in unique]
             new_population = self._breed(carried, gen)
+            child_note = (
+                f"parents {len(carried)} of {prune['kept']} unique; {self._children_phrase()}"
+            )
+        self._report(
+            f"Gen {gen}: scored {len(scored_pop)}; "
+            f"energy window (min + 0.1*|min| = {threshold:.6g}) dropped {energy_dropped}; "
+            f"dihedral-RMSD prune kept {prune['kept']} and "
+            f"{self._dihedral_prune_phrase(prune['dropped'], prune['nearest_dropped_rmsd'])}; "
+            f"{child_note}; population {len(new_population)}."
+        )
 
         before_scores = self.get_pairwise_rmsd_scores([coords for _, coords, _ in accepted])
         after_scores = self.get_pairwise_rmsd_scores([coords for coords, _, _ in new_population])

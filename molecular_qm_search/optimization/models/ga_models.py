@@ -84,8 +84,12 @@ class GAConfig(Model):
         0.1,
         title="Prune RMSD",
         description=(
-            "Minimum dihedral RMSD in degrees. A conformer closer than this "
-            "to one already kept is dropped and the population shrinks."
+            "Minimum dihedral RMSD in degrees between conformers that are both kept. "
+            "Each generation drops anyone closer than this to a lower-energy survivor, "
+            "carries the lowest 20% as parents, and refills with children. "
+            "Children that are too close are rejected. If a generation cannot refill, "
+            "pop_size shrinks permanently. The node returns at most num_confs conformers "
+            "from the last generation, not every geometry the search tried."
         ),
     )
     db_treatment: DoubleBondTreatment = Field(
@@ -168,8 +172,12 @@ class GAConformerParameters(Model):
         0.1,
         title="Prune RMSD",
         description=(
-            "Minimum dihedral RMSD in degrees. A conformer closer than this "
-            "to one already kept is dropped and the population shrinks."
+            "Minimum dihedral RMSD in degrees between conformers that are both kept. "
+            "Each generation drops anyone closer than this to a lower-energy survivor, "
+            "carries the lowest 20% as parents, and refills with children. "
+            "Children that are too close are rejected. If a generation cannot refill, "
+            "pop_size shrinks permanently. The node returns at most num_confs conformers "
+            "from the last generation, not every geometry the search tried."
         ),
     )
     db_treatment: DoubleBondTreatment = Field(
