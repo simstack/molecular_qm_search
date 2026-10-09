@@ -20,6 +20,8 @@ CALCULATOR_NODES = {
     "dftb_list_calculator": "molecular_qm_dftb.nodes.dftb_list_calculator.dftb_list_calculator",
     "xtb_molecule_list": "molecular_qm_psi4.nodes.crest.xtb_molecule_list",
     "xtb_optimize_molecule_list": "molecular_qm_psi4.nodes.crest.xtb_optimize_molecule_list",
+    "score_molecules_rdkit": "molecular_qm_util.rdkit_scripts.rdkit_optimize.score_molecules_rdkit",
+    "optimize_molecules_rdkit": "molecular_qm_util.rdkit_scripts.rdkit_optimize.optimize_molecules_rdkit",
 }
 
 

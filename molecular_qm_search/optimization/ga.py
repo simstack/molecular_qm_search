@@ -19,12 +19,16 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
     """Generate conformers with a genetic algorithm.
 
     DFTB evaluations run as one dftb_list_calculator child per batch. xTB
-    evaluations run as child nodes. RDKit force fields stay in-process.
+    evaluations run as child nodes. RDKit batches are the nodes
+    score_molecules_rdkit and optimize_molecules_rdkit. The genetic algorithm
+    runs that same force-field implementation in-process.
 
     Called Nodes:
         dftb_list_calculator
         xtb_molecule_list
         xtb_optimize_molecule_list
+        score_molecules_rdkit
+        optimize_molecules_rdkit
 
     Raises:
         ValueError: missing initial molecule, unknown mode, or invalid GA settings

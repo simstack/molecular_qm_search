@@ -34,9 +34,12 @@ results are not reconstructed from torsions. Backend failures raise exceptions.
 
 Available adapters:
 
-- `RDKitEvaluator`: calls `score_molecules_rdkit` and `optimize_molecules_rdkit`
-  in `molecular_qm_util`. Supports MMFF94, MMFF94s and UFF. RDKit conversion,
-  force-field construction and threaded batch evaluation stay in that package.
+- `RDKitEvaluator`: calls `evaluate_molecules_rdkit` in `molecular_qm_util`,
+  the implementation behind the `score_molecules_rdkit` and
+  `optimize_molecules_rdkit` nodes. Supports MMFF94, MMFF94s and UFF. RDKit
+  conversion, force-field construction and threaded batch evaluation stay in
+  that package and run in-process. Those nodes are declared called nodes of
+  `run_ga_conformer_gen`.
 - `DFTBEvaluator`: calls `molecular_qm_dftb.nodes.dftb_list_calculator` once per batch with `DftbInput`.
 - `XTBEvaluator`: calls `xtb_molecule_list` and `xtb_optimize_molecule_list` from
   `molecular_qm_psi4.nodes.crest`, using `XTBInput`. Use a version of that sister

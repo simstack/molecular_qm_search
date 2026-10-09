@@ -47,15 +47,19 @@ class RDKitEvaluator(BaseModel):
     threads: int = Field(default=0, ge=0)
 
     def score(self, molecules: list[Molecule]) -> list[Molecule]:
-        from molecular_qm_util import score_molecules_rdkit
+        from molecular_qm_util import evaluate_molecules_rdkit
 
-        return score_molecules_rdkit(molecules, self.forcefield, threads=self.threads)
+        return evaluate_molecules_rdkit(molecules, self.forcefield, threads=self.threads)
 
     def optimize(self, molecules: list[Molecule], *, max_iters: int) -> list[Molecule]:
-        from molecular_qm_util import optimize_molecules_rdkit
+        from molecular_qm_util import evaluate_molecules_rdkit
 
-        return optimize_molecules_rdkit(
-            molecules, self.forcefield, max_iters=max_iters, threads=self.threads
+        return evaluate_molecules_rdkit(
+            molecules,
+            self.forcefield,
+            optimize=True,
+            max_iters=max_iters,
+            threads=self.threads,
         )
 
 
