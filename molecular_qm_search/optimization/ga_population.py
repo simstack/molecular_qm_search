@@ -114,15 +114,15 @@ class PopulationGenerator:
         return population
 
     def reproduce(self, parents, target_size, prune_rms_thresh):
-        """Carry parents once and append only new mutations or crossovers.
+        """Carry parents once and append new mutations or crossovers.
 
         Each parent is ``(coordinates, origin, energy)``. Added conformers have
-        energy ``None``. A proposal that does not move a dihedral, or whose
-        dihedral RMSD to a conformer already kept is below ``prune_rms_thresh``
-        degrees, is discarded. After ``target_size`` discarded proposals in a
-        row, the returned population is shorter than requested.
-        ``last_rejection`` is ``noop`` or ``rmsd``, and ``rejected_rmsd`` is the
-        last discarded distance (0 when the proposal did not move).
+        energy ``None``. A proposal that does not move a dihedral is discarded.
+        Dihedral RMSD is not applied here: the caller scores the children and
+        then keeps the lower-energy conformer of each neighborhood.
+        After ``target_size - len(parents)`` discarded proposals in a row, the
+        returned population is shorter than requested. ``last_rejection`` is
+        ``noop`` when that happens, and ``rejected_rmsd`` stays unset.
         """
         if not parents:
             raise ValueError("Cannot reproduce an empty population")
@@ -149,15 +149,16 @@ class PopulationGenerator:
             "rejected_noop": 0,
             "closest_rejected_rmsd": None,
         }
+        child_quota = target_size - len(parents)
         rejected = 0
         n_coords = len(self.coordinates.elements)
         while len(population) < target_size:
-            if rejected >= target_size:
+            if rejected >= child_quota:
                 break
             if self.random.random() < self.mutation_rate:
                 donor = copy.deepcopy(self.random.choice(parents)[0])
                 if n_coords == 0:
-                    child, origin, distance = None, None, 0.0
+                    child, origin = None, None
                 else:
                     coord = donor.elements[self.random.randrange(n_coords)]
                     delta = self.random.uniform(-self.dihedral_interval, self.dihedral_interval)
@@ -165,18 +166,17 @@ class PopulationGenerator:
                             and coord.bond_type == InternalCoordinateBondType.DOUBLE):
                         delta += 180.0
                     if delta == 0:
-                        child, origin, distance = None, None, 0.0
+                        child, origin = None, None
                     else:
                         self._shift(coord, delta)
                         if coord.bond_type is None or not hasattr(coord.bond_type, "value"):
                             raise ValueError(f"Mutated coordinate has no bond type: {coord.bond_type!r}")
                         child, origin = donor, f"mutation-{coord.bond_type.value}"
-                        distance = min(dihedral_rmsd(child, kept[0]) for kept in population)
             else:
                 if len(parents) < 2:
                     raise ValueError("Crossover requires two parents")
                 if n_coords == 0:
-                    child, origin, distance = None, None, 0.0
+                    child, origin = None, None
                 else:
                     first, second = self.random.sample([individual[0] for individual in parents], 2)
                     point = self.random.randrange(n_coords)
@@ -184,20 +184,11 @@ class PopulationGenerator:
                         first.elements[:point] + second.elements[point:]
                     ))
                     origin = "crossover"
-                    distance = min(dihedral_rmsd(child, kept[0]) for kept in population)
-            if child is None or distance < prune_rms_thresh:
+            if child is None:
                 rejected += 1
-                if child is None:
-                    self.rejected_rmsd = 0.0
-                    self.last_rejection = "noop"
-                    self.reproduction_stats["rejected_noop"] += 1
-                else:
-                    self.rejected_rmsd = distance
-                    self.last_rejection = "rmsd"
-                    self.reproduction_stats["rejected_rmsd"] += 1
-                    closest = self.reproduction_stats["closest_rejected_rmsd"]
-                    if closest is None or distance < closest:
-                        self.reproduction_stats["closest_rejected_rmsd"] = distance
+                self.rejected_rmsd = 0.0
+                self.last_rejection = "noop"
+                self.reproduction_stats["rejected_noop"] += 1
                 continue
             rejected = 0
             self.reproduction_stats["accepted"] += 1

@@ -85,11 +85,11 @@ class GAConfig(Model):
         title="Prune RMSD",
         description=(
             "Minimum dihedral RMSD in degrees between conformers that are both kept. "
-            "Each generation drops anyone closer than this to a lower-energy survivor, "
-            "carries the lowest 20% as parents, and refills with children. "
-            "Children that are too close are rejected. If a generation cannot refill, "
-            "pop_size shrinks permanently. The node returns at most num_confs conformers "
-            "from the last generation, not every geometry the search tried."
+            "Each generation scores new children and keeps the lower-energy conformer "
+            "when one is closer than this to a parent or another child. "
+            "Parents and surviving children are sorted by energy and cut at pop_size. "
+            "The live population can grow back up to pop_size. "
+            "num_confs caps only the returned list."
         ),
     )
     db_treatment: DoubleBondTreatment = Field(
@@ -173,11 +173,11 @@ class GAConformerParameters(Model):
         title="Prune RMSD",
         description=(
             "Minimum dihedral RMSD in degrees between conformers that are both kept. "
-            "Each generation drops anyone closer than this to a lower-energy survivor, "
-            "carries the lowest 20% as parents, and refills with children. "
-            "Children that are too close are rejected. If a generation cannot refill, "
-            "pop_size shrinks permanently. The node returns at most num_confs conformers "
-            "from the last generation, not every geometry the search tried."
+            "Each generation scores new children and keeps the lower-energy conformer "
+            "when one is closer than this to a parent or another child. "
+            "Parents and surviving children are sorted by energy and cut at pop_size. "
+            "The live population can grow back up to pop_size. "
+            "num_confs caps only the returned list."
         ),
     )
     db_treatment: DoubleBondTreatment = Field(

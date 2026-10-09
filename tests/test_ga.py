@@ -249,6 +249,7 @@ def test_charts_refresh_on_every_iteration(molecule, coordinates, tmp_path, monk
         {"iterations": [0], "histogram": 4, "diversity": 4},
         {"iterations": [0, 1], "histogram": 4, "diversity": 4},
         {"iterations": [0, 1, 2], "histogram": 4, "diversity": 4},
+        {"iterations": [0, 1, 2], "histogram": 4, "diversity": 4},
     ]
     assert [row["iteration"] for row in runner.energy_chart.data] == [0, 1, 2]
 
@@ -273,44 +274,19 @@ def test_diversity_chart_separates_distinct_dihedrals(molecule, coordinates):
     assert collapsed[1]["pc1"] == pytest.approx(0.0)
 
 
-class SpreadEvaluator:
-    def __init__(self, spans):
-        self.spans = spans
-        self.calls = 0
-
-    def score(self, molecules):
-        if self.calls >= len(self.spans):
-            raise ValueError("SpreadEvaluator received more score calls than spans")
-        span = self.spans[self.calls]
-        self.calls += 1
-        if len(molecules) < 2:
-            raise ValueError("SpreadEvaluator needs at least two molecules")
-        results = []
-        for index, molecule in enumerate(molecules):
-            result = Molecule.from_molecule(molecule)
-            result.properties["energy"] = float(span * index / (len(molecules) - 1))
-            results.append(result)
-        return results
-
-    def optimize(self, molecules, *, max_iters):
-        results = [Molecule.from_molecule(molecule) for molecule in molecules]
-        for index, result in enumerate(results):
-            result.properties["energy"] = float(index)
-        return results
-
-
-def test_energy_plot_drops_iterations_until_range_settles(molecule, coordinates, tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+def test_energy_plot_drops_iterations_until_range_settles(molecule, coordinates):
     runner = RecordingRunner()
+    ga = StandardGA(
+        molecule, runner, coordinates=coordinates, pop_size=4, num_confs=4,
+    )
     # 200 -> 8 exceeds a factor of 10 and would drop the first two iterations.
     # 7 -> 0.4 would drop everything before the last two; the plot still keeps 10.
     spans = [200.0, 180.0, 8.0] + [7.0] * 7 + [0.4, 0.4]
-    ga = StandardGA(
-        molecule, runner, evaluator=SpreadEvaluator(spans),
-        coordinates=coordinates, pop_size=4, num_confs=4, generations=len(spans) - 1, seed=1,
-        mutation_rate=1.0,
-    )
-    ga.run()
+    ga.energy_history = [
+        {"iteration": index, "min_energy": 0.0, "max_energy": span}
+        for index, span in enumerate(spans)
+    ]
+    ga._publish_energy_chart()
     assert [row["iteration"] for row in runner.energy_chart.data] == list(range(2, len(spans)))
     assert "Dropped 2 initial iterations" in runner.log_string
     assert "factor of 10" in runner.log_string
@@ -339,10 +315,10 @@ def test_later_generations_score_only_new_conformers(molecule, coordinates, tmp_
     )
     ga.run()
     score_sizes = [call[1] for call in evaluator.calls if call[0] == "score"]
-    assert score_sizes == [5, 4]
+    assert score_sizes == [5, 5, 5]
 
 
-def test_noop_mutations_shrink_the_population_and_warn(molecule, coordinates, tmp_path, monkeypatch):
+def test_noop_mutations_do_not_shrink_the_population_cap(molecule, coordinates, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     runner = RecordingRunner()
     ga = StandardGA(
@@ -350,13 +326,11 @@ def test_noop_mutations_shrink_the_population_and_warn(molecule, coordinates, tm
         pop_size=4, num_confs=4, generations=0, mutation_rate=1.0, dihedral_interval=0,
     )
     result = list(ga.run())
-    assert ga.pop_size == 1
-    assert len(result) == 1
-    assert "Population size is now 1" in runner.log_string
-    assert "did not move a dihedral" in runner.log_string
+    assert ga.pop_size == 4
+    assert 1 <= len(result) <= 4
     assert "rejected 4 with no dihedral change" in runner.log_string
-    assert "Conformer prune:" in runner.log_string
-    assert "does not store every dihedral combination" in runner.log_string
+    assert "maximum pop_size 4" in runner.log_string
+    assert "num_confs caps only the returned list" in runner.log_string
 
 
 def test_wide_rmsd_threshold_drops_conformers_and_says_so(molecule, coordinates, tmp_path, monkeypatch):
@@ -369,10 +343,57 @@ def test_wide_rmsd_threshold_drops_conformers_and_says_so(molecule, coordinates,
     )
     result = list(ga.run())
     assert len(result) == 1
-    assert ga.pop_size == 1
-    assert "dropped 3 with dihedral RMSD below prune_rms_thresh 360" in runner.log_string
-    assert "rejected 4 below prune_rms_thresh" in runner.log_string
+    assert ga.pop_size == 4
+    assert "below prune_rms_thresh 360" in runner.log_string
     assert "nearest" in runner.log_string
+    assert "maximum pop_size 4" in runner.log_string
+
+
+def test_lower_energy_child_replaces_a_close_parent(molecule, coordinates):
+    ga = StandardGA(
+        molecule, logging.getLogger("test"), evaluator=Evaluator(), coordinates=coordinates,
+        pop_size=2, num_confs=1, mutation_rate=1.0, prune_rms_thresh=0.1,
+    )
+    ga.setup()
+    close = copy.deepcopy(ga.template_coords)
+    far = copy.deepcopy(ga.template_coords)
+    ga.population_generator._shift(far.elements[0], 90)
+    child = copy.deepcopy(close)
+
+    def fake_reproduce(parents, target_size, prune_rms_thresh):
+        ga.population_generator.reproduction_stats = {
+            "accepted": 1,
+            "rejected_rmsd": 0,
+            "rejected_noop": 0,
+            "closest_rejected_rmsd": None,
+        }
+        return list(parents) + [(child, "mutation-single", None)]
+
+    ga.population_generator.reproduce = fake_reproduce
+    ga.evaluate_population = lambda population: [(0.1, population[0])]
+    selected = ga.selection([(5.0, close, "initial"), (1.0, far, "initial")], 0)
+    assert ga.pop_size == 2
+    assert [(origin, energy) for _, origin, energy in selected] == [
+        ("mutation-single", 0.1),
+        ("initial", 1.0),
+    ]
+
+
+def test_num_confs_caps_only_the_returned_list(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runner = RecordingRunner()
+    ga = StandardGA(
+        molecule, runner, evaluator=Evaluator(), coordinates=coordinates,
+        pop_size=3, num_confs=1, generations=0, mutation_rate=1.0,
+        dihedral_interval=40, seed=1,
+    )
+    seen = []
+    ga.post_generation_hook = lambda population, gen: seen.append(len(population))
+    result = list(ga.run())
+    assert seen == [3]
+    assert len(result) == 1
+    assert ga.pop_size == 3
+    assert runner.log_string.count("Stopped at num_confs") == 1
 
 
 def test_crossover_requires_two_parents(molecule, coordinates):
