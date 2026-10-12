@@ -6,7 +6,10 @@ import math
 import random
 
 from molecular_qm_models import InternalCoordinatesList, Molecule
-from molecular_qm_models.internal_coordinates import InternalCoordinateBondType
+from molecular_qm_models.internal_coordinates import (
+    InternalCoordinateBase,
+    InternalCoordinateBondType,
+)
 
 
 def dihedral_rmsd(left: InternalCoordinatesList, right: InternalCoordinatesList) -> float:
@@ -67,11 +70,81 @@ class PopulationGenerator:
         self.last_rejection = None
         self.reproduction_stats = None
 
+    def _chosen_fragment(self, coord) -> tuple[list[int], bool]:
+        """Smaller side of the bond, and whether that side is the atom-2 side.
+
+        Equal sizes use the atom-2 side. ``InternalDihedralCoordinate.set``
+        realizes the requested angle on that side and turns the atom-4 side
+        backwards.
+        """
+        atom1, atom2, atom3, atom4 = coord.atom_indices
+        side_2 = InternalCoordinateBase.get_moving_atoms(
+            self.molecule, (atom3, atom2), collision_set=[atom4]
+        )
+        side_4 = InternalCoordinateBase.get_moving_atoms(
+            self.molecule, (atom2, atom3), collision_set=[atom1]
+        )
+        use_atom2_side = bool(side_2) and len(side_2) <= len(side_4)
+        moving = side_2 if use_atom2_side else side_4
+        if not moving:
+            raise ValueError(
+                f"Dihedral {tuple(coord.atom_indices)} has no rotatable fragment"
+            )
+        return moving, use_atom2_side
+
+    def _apply_dihedral(self, coord, molecule: Molecule) -> list[int]:
+        """Rotate the smaller side until the geometry shows ``coord``'s angle.
+
+        The atom-4 side is used only when it is smaller. Its target is reflected
+        so the backwards rotation in ``set`` still hits the stored angle.
+        """
+        moving, use_atom2_side = self._chosen_fragment(coord)
+        target = float(coord.get_actual_value(coord.value))
+        if not math.isfinite(target):
+            raise ValueError(
+                f"Dihedral {tuple(coord.atom_indices)} has a non-finite angle {target}"
+            )
+        low, high = float(coord.min_values[0]), float(coord.max_values[0])
+        span = high - low
+        if span <= 0:
+            raise ValueError(
+                f"Dihedral {tuple(coord.atom_indices)} bounds must have positive width"
+            )
+        current = copy.deepcopy(coord)
+        current.moving_atoms = list(moving)
+        if use_atom2_side:
+            value = coord.value
+        else:
+            probe = copy.deepcopy(coord)
+            probe.compute(molecule)
+            current_angle = float(probe.real_values[0])
+            if not math.isfinite(current_angle):
+                raise ValueError(
+                    f"Dihedral {tuple(coord.atom_indices)} has a non-finite geometry angle"
+                )
+            reflected = (2.0 * current_angle - target - low) % span + low
+            value = (reflected - low) / span
+        current.set(molecule, value)
+        measured = float(current.real_values[0])
+        mismatch = (measured - target + 180.0) % 360.0 - 180.0
+        if abs(mismatch) > 1e-4:
+            raise ValueError(
+                f"Dihedral {tuple(coord.atom_indices)} measured {measured} degrees, "
+                f"expected {target}"
+            )
+        return list(moving)
+
     def molecule_from_coordinates(self, coordinates: InternalCoordinatesList) -> Molecule:
         result = self._copy_molecule(self.molecule)
-        # Coordinate.set() updates the coordinate itself as well as the geometry.
-        for coord in copy.deepcopy(coordinates.elements):
-            coord.set(result, coord.value)
+        # Larger fragments first, so a later smaller torsion can set its own angle
+        # without being overwritten by a rotation of the rest of the molecule.
+        ordered = sorted(
+            coordinates.elements,
+            key=lambda coord: len(self._chosen_fragment(coord)[0]),
+            reverse=True,
+        )
+        for coord in ordered:
+            self._apply_dihedral(coord, result)
         for key in ("energy", "energy_hartree", "energy_unit", "method", "rank_id",
                     "optimization_converged"):
             result.properties.pop(key, None)

@@ -122,6 +122,7 @@ class BaseGA:
         self.input_coordinates = coordinates
         self.population_generator = None
         self.evaluated_molecules: List[Molecule] = []
+        self._dihedral_histogram_names: List[str] = []
 
     def molecule_from_coordinates(self, coords: InternalCoordinatesList) -> Molecule:
         return self.population_generator.molecule_from_coordinates(coords)
@@ -570,6 +571,78 @@ class BaseGA:
             legend=AGChartLegendConfig(enabled=False),
         )
 
+    def _publish_dihedral_histograms(self, population: List[InternalCoordinatesList]) -> None:
+        if not population:
+            raise ValueError("Cannot build dihedral histograms for an empty population")
+        width = len(population[0].elements)
+        if width == 0:
+            return
+        if self._dihedral_histogram_names and len(self._dihedral_histogram_names) != width:
+            raise ValueError(
+                f"Dihedral histogram count changed from {len(self._dihedral_histogram_names)} to {width}"
+            )
+        samples = [[] for _ in range(width)]
+        labels = []
+        for individual in population:
+            if len(individual.elements) != width:
+                raise ValueError("Dihedral histograms received inconsistent dihedral lists")
+            for index, coordinate in enumerate(individual.elements):
+                angle = float(coordinate.get_actual_value(coordinate.value))
+                if not np.isfinite(angle):
+                    raise ValueError(f"Dihedral {index} has a non-finite angle {angle}")
+                samples[index].append(angle)
+                if len(labels) == index:
+                    labels.append("-".join(str(atom) for atom in coordinate.atom_indices))
+        bin_count = 12
+        bin_width = 30.0
+        fills = ("#45B7D1", "#F4A261", "#2A9D8F", "#E76F51", "#6D597A", "#457B9D")
+        for index, angles in enumerate(samples):
+            counts = [0] * bin_count
+            for angle in angles:
+                wrapped = (angle + 180.0) % 360.0 - 180.0
+                bin_index = int((wrapped + 180.0) / bin_width)
+                if bin_index == bin_count:
+                    bin_index = 0
+                counts[bin_index] += 1
+            bins = [
+                {
+                    "angle": f"{-180.0 + bin_index * bin_width:.6g} – "
+                             f"{-180.0 + (bin_index + 1) * bin_width:.6g}",
+                    "count": counts[bin_index],
+                }
+                for bin_index in range(bin_count)
+            ]
+            series = [
+                AGColumnSeriesConfig(
+                    type="column",
+                    xKey="angle",
+                    yKey="count",
+                    title="count",
+                    data=bins,
+                    fill=fills[index % len(fills)],
+                )
+            ]
+            name = f"dihedral_histogram_{index}"
+            title = AGChartTitleConfig(text=f"Dihedral {labels[index]}")
+            chart = getattr(self.node_runner, name, None)
+            if isinstance(chart, ChartArtifactModel):
+                chart.title = title
+                chart.data = bins
+                chart.series = series
+            else:
+                setattr(self.node_runner, name, ChartArtifactModel(
+                    data=bins,
+                    title=title,
+                    series=series,
+                    axes=[
+                        AGChartAxisConfig(type="category", position="bottom", title="angle"),
+                        AGChartAxisConfig(type="number", position="left", title="count"),
+                    ],
+                    legend=AGChartLegendConfig(enabled=False),
+                ))
+            if name not in self._dihedral_histogram_names:
+                self._dihedral_histogram_names.append(name)
+
     def _persist_live_artifacts(self) -> None:
         from odmantic import ObjectId
         from simstack.core.context import context
@@ -593,7 +666,7 @@ class BaseGA:
             raise RuntimeError("Publish GA artifacts from the worker thread, not the event loop")
         parent_id = task_id if isinstance(task_id, ObjectId) else ObjectId(str(task_id))
         charts = []
-        for name in ("energy_chart", "energy_histogram", "diversity_chart"):
+        for name in ("energy_chart", "energy_histogram", "diversity_chart", *self._dihedral_histogram_names):
             chart = getattr(self.node_runner, name, None)
             if chart is None:
                 continue
@@ -612,6 +685,11 @@ class BaseGA:
         self._publish_energy_chart()
         self._publish_energy_histogram([
             float(molecule.properties["energy"]) for molecule in molecules
+        ])
+        if self.population_generator is None:
+            raise ValueError("Cannot measure dihedral histograms before the population generator exists")
+        self._publish_dihedral_histograms([
+            self.coordinates_from_molecule(molecule) for molecule in molecules
         ])
         table = SimpleTable(name="Population change success rates")
         table.add_column("change", SimpleTableColumnType.STRING)
@@ -722,6 +800,7 @@ class BaseGA:
             self._publish_energy_chart()
             self._publish_energy_histogram(energies)
             self._publish_diversity_chart(scored_coords)
+            self._publish_dihedral_histograms(scored_coords)
             self._persist_live_artifacts()
             scored_with_labels = [(energy, coords, origin) for coords, origin, energy in population]
             population = self.selection(scored_with_labels, gen)

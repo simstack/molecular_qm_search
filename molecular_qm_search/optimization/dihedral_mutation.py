@@ -76,15 +76,16 @@ def mutated_dihedral_molecules(molecule: Molecule) -> list[Molecule]:
                 )
             isolated = generator._copy_molecule(molecule)
             coord = copy.deepcopy(child.elements[index])
-            coord.set(isolated, coord.value)
-            measured = coord.real_values[0]
+            moving = set(generator._apply_dihedral(coord, isolated))
+            probe = copy.deepcopy(coord)
+            probe.compute(isolated)
+            measured = probe.real_values[0]
             if abs(_wrapped_degrees(measured, target)) > 1e-4:
                 raise ValueError(
                     f"Dihedral {tuple(source.atom_indices)} measured {measured} degrees "
                     f"after a {delta} degree mutation, expected {target}"
                 )
             moved = _positions(isolated)
-            moving = set(coord.moving_atoms)
             for atom_index in range(len(molecule.atoms)):
                 shift = float(np.linalg.norm(moved[atom_index] - original[atom_index]))
                 if atom_index not in moving and shift > 1e-6:
@@ -120,9 +121,14 @@ def mutated_dihedral_molecules(molecule: Molecule) -> list[Molecule]:
                     f"A {delta} degree mutation of dihedral {tuple(source.atom_indices)} "
                     "did not move the fragment"
                 )
-            if a4 not in moving:
+            atom1 = coord.atom_indices[0]
+            if atom1 not in moving and a4 not in moving:
                 raise ValueError(
-                    f"The fourth atom of dihedral {tuple(source.atom_indices)} is not in the moving fragment"
+                    f"Neither end of dihedral {tuple(source.atom_indices)} is in the moving fragment"
+                )
+            if atom1 in moving and a4 in moving:
+                raise ValueError(
+                    f"Dihedral {tuple(source.atom_indices)} rotates both ends of the bond"
                 )
             rebuilt = generator.molecule_from_coordinates(child)
             checked = generator.coordinates_from_molecule(rebuilt)
@@ -144,11 +150,13 @@ def mutated_dihedral_molecules(molecule: Molecule) -> list[Molecule]:
     if len(selected) != 2:
         raise ValueError(f"Expected two selected mutants, built {len(selected)}")
 
-    parents = [(copy.deepcopy(template), "initial")]
-    offspring = generator.reproduce(parents, 4)
+    parents = [(copy.deepcopy(template), "initial", None)]
+    offspring = generator.reproduce(parents, 4, 0.1)
     if len(offspring) != 4 or offspring[0][1] != "initial":
-        raise ValueError(f"reproduce did not keep the parent: {[(origin) for _, origin in offspring]}")
-    for individual, origin in offspring[1:]:
+        raise ValueError(
+            f"reproduce did not keep the parent: {[origin for _, origin, _ in offspring]}"
+        )
+    for individual, origin, _ in offspring[1:]:
         if not origin.startswith("mutation-"):
             raise ValueError(f"Expected a mutation origin, got {origin!r}")
         changed = []

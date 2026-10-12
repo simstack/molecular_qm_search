@@ -94,6 +94,43 @@ def test_generation_is_reproducible_and_does_not_modify_inputs(molecule, coordin
     assert random.getstate() == state
 
 
+def test_each_dihedral_gets_a_full_circle_histogram(molecule, coordinates):
+    runner = logging.getLogger("dihedral-histograms")
+    ga = StandardGA(
+        molecule, runner, evaluator=Evaluator(), coordinates=coordinates,
+        pop_size=4, generations=0, num_confs=4,
+    )
+    ga.setup()
+    population = [coords for coords, *_ in ga.population_generator.generate(8)]
+    targets = [-180.0, -150.0, -90.0, 0.0, 30.0, 149.9, 150.0, 180.0]
+    for individual, angle in zip(population, targets):
+        coordinate = individual.elements[0]
+        low = coordinate.min_values[0]
+        high = coordinate.max_values[0]
+        coordinate.value = (angle - low) / (high - low)
+        coordinate.real_values = [angle]
+    ga._publish_dihedral_histograms(population)
+    chart = runner.dihedral_histogram_0
+    assert chart.title.text == "Dihedral 0-1-2-3"
+    assert [row["angle"] for row in chart.data] == [
+        f"{-180 + index * 30} – {-150 + index * 30}" for index in range(12)
+    ]
+    assert [row["count"] for row in chart.data] == [2, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1]
+    assert sum(row["count"] for row in chart.data) == 8
+    assert getattr(runner, "dihedral_histogram_1", None) is None
+    ga._publish_dihedral_histograms(population[:1])
+    assert runner.dihedral_histogram_0 is chart
+    assert sum(row["count"] for row in chart.data) == 1
+
+    empty = StandardGA(
+        molecule, logging.getLogger("no-dihedrals"), evaluator=Evaluator(),
+        coordinates=InternalCoordinatesList(), pop_size=1, generations=0,
+    )
+    empty.setup()
+    empty._publish_dihedral_histograms([InternalCoordinatesList()])
+    assert empty._dihedral_histogram_names == []
+
+
 def test_double_bond_mutation_flips_relative_to_parent(molecule, coordinates):
     coordinates.elements[0].bond_type = InternalCoordinateBondType.DOUBLE
     generator = PopulationGenerator(molecule, coordinates=coordinates, mutation_rate=1,

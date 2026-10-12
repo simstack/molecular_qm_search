@@ -3,7 +3,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 from molecular_qm_models import Molecule
-from molecular_qm_models.internal_coordinates import InternalCoordinateBondType
+from molecular_qm_models.internal_coordinates import (
+    InternalCoordinateBase,
+    InternalCoordinateBondType,
+)
 
 from molecular_qm_search.optimization.dihedral_mutation import (
     _positions,
@@ -69,6 +72,18 @@ def _geometry_matches_dihedrals(generator, individual):
         mismatch = _wrapped_degrees(actual.real_values[0], stored.get_actual_value(stored.value))
         assert abs(mismatch) < 1e-3
     assert [atom.element for atom in built.atoms] == [atom.element for atom in generator.molecule.atoms]
+    adjacency = InternalCoordinateBase._get_adjacency(generator.molecule)
+    template = _positions(generator.molecule)
+    positions = _positions(built)
+    for left, neighbors in enumerate(adjacency):
+        for right in neighbors:
+            if right <= left:
+                continue
+            before = float(np.linalg.norm(template[left] - template[right]))
+            after = float(np.linalg.norm(positions[left] - positions[right]))
+            assert abs(after - before) < 1e-4, (
+                f"Bond {left}-{right} stretched from {before} to {after}"
+            )
     return built
 
 
