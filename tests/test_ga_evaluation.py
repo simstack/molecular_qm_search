@@ -242,6 +242,36 @@ def test_xtb_failed_batch_is_rejected(xtb_stub, molecule):
         XTBEvaluator().score([molecule])
 
 
+def test_rdkit_evaluator_scores_molecules_in_process(monkeypatch, molecule):
+    calls = []
+
+    def evaluate(molecules, forcefield, *, optimize=False, max_iters=500, threads=0):
+        calls.append((molecules, forcefield, optimize, max_iters, threads))
+        scored = Molecule.from_molecule(molecules[0])
+        scored.properties = dict(molecules[0].properties)
+        scored.properties.update(energy=1.5, energy_unit="kcal/mol")
+        return [scored]
+
+    def node_call(*args, **kwargs):
+        raise AssertionError(args)
+
+    import molecular_qm_util
+
+    monkeypatch.setattr(molecular_qm_util, "evaluate_molecules_rdkit", evaluate, raising=False)
+    monkeypatch.setattr(molecular_qm_util, "score_molecules_rdkit", node_call, raising=False)
+    monkeypatch.setattr(molecular_qm_util, "optimize_molecules_rdkit", node_call, raising=False)
+
+    evaluator = make_evaluator(GAOptimizationMethod.RDKIT_UFF, parallel_children=2)
+    scored = evaluator.score([molecule])
+    optimized = evaluator.optimize([molecule], max_iters=17)
+
+    assert calls[0] == ([molecule], "uff", False, 500, 2)
+    assert calls[1] == ([molecule], "uff", True, 17, 2)
+    assert scored[0].properties["energy"] == 1.5
+    assert optimized[0].properties["energy"] == 1.5
+    assert molecule.properties == {"label": "original"}
+
+
 def test_evaluator_configuration_uses_pydantic_validation():
     evaluator = RDKitEvaluator.model_validate({"forcefield": "uff", "threads": 2})
     assert isinstance(evaluator, BaseModel)
