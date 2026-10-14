@@ -237,6 +237,7 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
     assert len(conformers) == 6
     assert "Population:     12" in runner.log_string
     assert "Seed population: the input geometry alone" in runner.log_string
+    assert "at or above prune_rms_thresh" in runner.log_string
     assert "Dihedral Types:" in runner.log_string
     assert runner.log_string == "\n".join(runner.info_messages) + "\n"
     chart = runner.energy_chart
@@ -295,9 +296,8 @@ def test_charts_refresh_on_every_iteration(molecule, coordinates, tmp_path, monk
     )
     ga.run()
     assert seen == [
-        {"iterations": [0], "histogram": 1, "diversity": None},
+        {"iterations": [0], "histogram": 4, "diversity": 4},
         {"iterations": [0, 1], "histogram": 4, "diversity": 4},
-        {"iterations": [0, 1, 2], "histogram": 4, "diversity": 4},
         {"iterations": [0, 1, 2], "histogram": 4, "diversity": 4},
     ]
     assert [row["iteration"] for row in runner.energy_chart.data] == [0, 1, 2]

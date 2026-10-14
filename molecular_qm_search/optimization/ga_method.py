@@ -475,6 +475,24 @@ class BaseGA:
         combined.sort(key=lambda item: item[0])
         unique, prune = self._unique_conformers(combined)
         kept = unique[:self.pop_size]
+        nearest_pair = None
+        for index, (_, coords, _) in enumerate(kept):
+            for _, other, _ in kept[index + 1:]:
+                distance = self.dihedral_rmsd(coords, other)
+                if nearest_pair is None or distance < nearest_pair:
+                    nearest_pair = distance
+                if distance < self.prune_rms_thresh:
+                    raise ValueError(
+                        f"Generation {gen} kept two conformers {distance:.4f} degrees apart, "
+                        f"below prune_rms_thresh {self.prune_rms_thresh}"
+                    )
+        if nearest_pair is None:
+            separation = "one conformer, so no pair to compare"
+        else:
+            separation = (
+                f"closest pair is {float(nearest_pair):.4f} degrees, "
+                f"at or above prune_rms_thresh {self.prune_rms_thresh}"
+            )
         self._report(
             f"Gen {gen}: parents {len(parents)}; "
             f"children accepted {stats['accepted']}, "
@@ -482,7 +500,8 @@ class BaseGA:
             f"dihedral-RMSD prune kept {prune['kept']} and "
             f"{self._dihedral_prune_phrase(prune['dropped'], prune['nearest_dropped_rmsd'])}; "
             f"energy sort kept {len(kept)} "
-            f"(current population {len(kept)}, maximum pop_size {self.pop_size})."
+            f"(current population {len(kept)}, maximum pop_size {self.pop_size}); "
+            f"{separation}."
         )
         return [(coords, origin, energy) for energy, coords, origin in kept]
 
@@ -931,6 +950,11 @@ class BaseGA:
                     if energy is None or not np.isfinite(energy):
                         raise ValueError("Population conformer has no finite energy")
                     population[index] = (coords, population[index][1], float(energy))
+            for _, _, energy in population:
+                if energy is None or not np.isfinite(energy):
+                    raise ValueError("Population conformer has no finite energy")
+            scored_with_labels = [(energy, coords, origin) for coords, origin, energy in population]
+            population = self.selection(scored_with_labels, gen)
             energies = []
             scored_coords = []
             for coords, _, energy in population:
@@ -945,8 +969,6 @@ class BaseGA:
             self._publish_diversity_chart(scored_coords)
             self._publish_dihedral_histograms(scored_coords)
             self._persist_live_artifacts()
-            scored_with_labels = [(energy, coords, origin) for coords, origin, energy in population]
-            population = self.selection(scored_with_labels, gen)
             self.post_generation_hook([coords for coords, _, _ in population], gen)
 
             # Save state at the end of each generation (or every n generations)
