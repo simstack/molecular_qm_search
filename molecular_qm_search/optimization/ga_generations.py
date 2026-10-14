@@ -1,4 +1,5 @@
 """Inspection run of the first three GA generations."""
+import asyncio
 import logging
 
 from molecular_qm_models import Molecule, MoleculeList
@@ -41,6 +42,7 @@ def ga_generation_lists(
     node_runner=None,
     evaluator=None,
     coordinates=None,
+    artifact_loop=None,
 ) -> list[MoleculeList]:
     """Run three GA iterations at population size 10 and return each scored generation.
 
@@ -72,6 +74,7 @@ def ga_generation_lists(
         rotatable_bond_min=-180.0,
         rotatable_bond_max=180.0,
         optimization_method=GAOptimizationMethod.RDKIT_UFF,
+        artifact_loop=artifact_loop,
     )
     ga.run()
     expected = GA_INSPECTION_GENERATIONS + 1
@@ -104,7 +107,12 @@ async def inspect_ga_generations(molecule: Molecule, **kwargs) -> SimstackResult
     node_runner = kwargs.get("node_runner")
     if node_runner is None:
         raise ValueError("inspect_ga_generations requires node_runner")
-    lists = ga_generation_lists(molecule, node_runner=node_runner)
+    lists = await asyncio.to_thread(
+        ga_generation_lists,
+        molecule,
+        node_runner=node_runner,
+        artifact_loop=asyncio.get_running_loop(),
+    )
     for index, molecule_list in enumerate(lists):
         setattr(node_runner, f"generation_{index}", molecule_list)
     node_runner.info(
