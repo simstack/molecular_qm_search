@@ -514,7 +514,7 @@ def test_overlapping_conformer_is_excluded_and_not_scored(molecule, coordinates,
     overlapped.atoms[3].z = overlapped.atoms[0].z
     overlap = ga._overlapping_atoms(overlapped)
     assert overlap is not None
-    assert "C1 and C3" in overlap
+    assert "C2 and C4" in overlap
     original = ga.molecule_from_coordinates
 
     def collide(coords):
@@ -532,6 +532,32 @@ def test_overlapping_conformer_is_excluded_and_not_scored(molecule, coordinates,
     assert kept == [(good, "initial", None)]
     assert evaluator.calls == []
     assert "positive infinity" in runner.log_string
+
+
+def test_hydrogens_0_982_angstrom_apart_overlap_and_a_normal_contact_does_not():
+    seed = Molecule(atoms=[
+        Atom(element="C", x=0, y=0, z=0),
+        Atom(element="H", x=1.09, y=0, z=0),
+        Atom(element="C", x=4, y=0, z=0),
+        Atom(element="H", x=5.09, y=0, z=0),
+    ])
+    ga = StandardGA(
+        seed, logging.getLogger("test"), coordinates=InternalCoordinatesList(),
+        pop_size=1, generations=0,
+    )
+    ga.setup()
+    assert ga._overlapping_atoms(seed) is None
+    touching = Molecule.from_molecule(seed)
+    touching.atoms[3].x = touching.atoms[1].x + 0.982
+    touching.atoms[3].y = 0
+    touching.atoms[3].z = 0
+    overlap = ga._overlapping_atoms(touching)
+    assert overlap is not None
+    assert "H2 and H4" in overlap
+    assert "0.982" in overlap
+    separated = Molecule.from_molecule(seed)
+    separated.atoms[3].x = separated.atoms[1].x + 1.72
+    assert ga._overlapping_atoms(separated) is None
 
 
 @pytest.mark.parametrize("ga_class", [StandardGA, MinimizingGA, DiversityGA])

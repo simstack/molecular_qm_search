@@ -36,6 +36,13 @@ _COVALENT_RADII = {
     "Li": 1.28, "Be": 0.96, "B": 0.84, "C": 0.76, "N": 0.71, "O": 0.66, "F": 0.57, "Ne": 0.58,
     "Na": 1.66, "Mg": 1.41, "Al": 1.21, "Si": 1.11, "P": 1.07, "S": 1.05, "Cl": 1.02,
 }
+_VDW_RADII = {
+    "H": 1.20, "C": 1.70, "N": 1.55, "O": 1.52, "F": 1.47, "S": 1.80, "P": 1.80, "Cl": 1.75,
+    "B": 1.92, "Si": 2.10,
+}
+# Non-bonded pairs closer than this fraction of the van der Waals sum are overlaps.
+# 0.6 puts an H-H limit at 1.44 A, so 0.982 A fails and a normal 1.7 A contact does not.
+_OVERLAP_VDW_FRACTION = 0.6
 
 
 def _to_molecule_list(molecules) -> MoleculeList:
@@ -232,6 +239,11 @@ class BaseGA:
             raise ValueError(f"No covalent radius for element {element}")
         return _COVALENT_RADII[element]
 
+    def _vdw_radius(self, element: str) -> float:
+        if element not in _VDW_RADII:
+            raise ValueError(f"No van der Waals radius for element {element}")
+        return _VDW_RADII[element]
+
     def _bonds_of(self, molecule: Molecule):
         atoms = molecule.atoms
         bonded = set()
@@ -254,21 +266,21 @@ class BaseGA:
             )
         worst = None
         for i in range(len(atoms)):
-            radius_i = self._covalent_radius(atoms[i].element)
+            radius_i = self._vdw_radius(atoms[i].element)
             for j in range(i + 1, len(atoms)):
                 if (i, j) in self._bonded_pairs:
                     continue
-                radius_j = self._covalent_radius(atoms[j].element)
+                radius_j = self._vdw_radius(atoms[j].element)
                 distance = atoms[i].distance_to(atoms[j])
-                limit = radius_i + radius_j
+                limit = _OVERLAP_VDW_FRACTION * (radius_i + radius_j)
                 if distance < limit and (worst is None or distance < worst[0]):
                     worst = (distance, i, atoms[i].element, j, atoms[j].element, limit)
         if worst is None:
             return None
         distance, i, element_i, j, element_j, limit = worst
         return (
-            f"{element_i}{i} and {element_j}{j} are {distance:.3f} A apart, "
-            f"inside the covalent limit {limit:.3f} A"
+            f"{element_i}{i + 1} and {element_j}{j + 1} are {distance:.3f} A apart, "
+            f"inside {_OVERLAP_VDW_FRACTION:g} times the van der Waals sum {limit:.3f} A"
         )
 
     def _exclude_overlaps(self, population):
