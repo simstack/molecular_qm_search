@@ -114,6 +114,7 @@ def test_node_documents_molecule_list_chart_and_statistics():
     assert parsed["energy_histogram"]["type"] == "ChartArtifactModel"
     assert parsed["diversity_chart"]["type"] == "ChartArtifactModel"
     assert parsed["operator_stats"]["type"] == "SimpleTable"
+    assert parsed["conformation_energies"]["type"] == "SimpleTable"
 
 
 @pytest.mark.asyncio

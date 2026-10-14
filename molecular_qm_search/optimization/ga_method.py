@@ -827,6 +827,17 @@ class BaseGA:
                 "success_rate": rate,
             })
         self.node_runner.operator_stats = table
+        energies = SimpleTable(name="Conformation energies")
+        energies.add_column("conformation", SimpleTableColumnType.NUMBER)
+        energies.add_column("origin", SimpleTableColumnType.STRING)
+        energies.add_column("energy", SimpleTableColumnType.NUMBER)
+        for row in self._conformation_rows:
+            energies.add_row({
+                "conformation": row["conformation"],
+                "origin": row["origin"],
+                "energy": row["energy"],
+            })
+        self.node_runner.conformation_energies = energies
         self._persist_live_artifacts()
         self._report(f"Returning {len(molecules)} population molecules.")
 

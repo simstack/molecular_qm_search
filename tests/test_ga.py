@@ -253,6 +253,10 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
     for row in table.row:
         assert 0 <= row["success_rate"] <= 1
         assert row["elite_survivors"] <= row["produced"]
+    energies = runner.conformation_energies
+    assert energies.heading == ["conformation", "origin", "energy"]
+    assert energies.type == ["number", "string", "number"]
+    assert [row["energy"] for row in energies.row] == sorted(row["energy"] for row in energies.row)
     histogram = runner.energy_histogram
     assert histogram.series[0].type == "column"
     assert histogram.series[0].yKey == "count"
