@@ -232,6 +232,9 @@ class BaseGA:
             for c in self.template_coords.elements
         ]
         self._bonded_pairs = self._bonds_of(self.initial_mol)
+        bind_connectivity = getattr(self.evaluator, "bind_connectivity", None)
+        if bind_connectivity is not None:
+            bind_connectivity(self.initial_mol)
         self.timing["Setup"] = time.perf_counter() - t0
 
     def _covalent_radius(self, element: str) -> float:
@@ -990,6 +993,17 @@ class StandardGA(BaseGA):
         optimized = self.evaluate_molecules(molecules, optimize=True)
         if optimized:
             self.best_energy_seen = min(m.properties["energy"] for m in optimized)
+        # #region agent log
+        from molecular_qm_search.optimization.lib.ga_evaluation import _agent_debug
+
+        overlaps = [self._overlapping_atoms(molecule) for molecule in optimized]
+        _agent_debug("B", "final UFF population", {
+            "returned_before_prune": len(optimized),
+            "overlaps": sum(item is not None for item in overlaps),
+            "first_overlap": next((item for item in overlaps if item is not None), None),
+            "energies": [round(float(molecule.properties["energy"]), 3) for molecule in optimized[:8]],
+        })
+        # #endregion
         return self._ranked_population(optimized, limit=self.num_confs)
 
 

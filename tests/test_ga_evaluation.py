@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -270,6 +271,38 @@ def test_rdkit_evaluator_scores_molecules_in_process(monkeypatch, molecule):
     assert scored[0].properties["energy"] == 1.5
     assert optimized[0].properties["energy"] == 1.5
     assert molecule.properties == {"label": "original"}
+
+
+def test_a_clashing_conformer_is_scored_on_the_input_bonds():
+    pytest.importorskip("rdkit")
+    from molecular_qm_search.optimization.ga_population import PopulationGenerator
+    from molecular_qm_util.rdkit_scripts.rdkit_optimize import evaluate_molecules_rdkit
+
+    seed = Molecule.from_xyz((Path(__file__).parents[1] / "data" / "test1.xyz").read_text(encoding="utf-8"))
+    generator = PopulationGenerator(
+        seed, seed=1, mutation_rate=0.5, dihedral_interval=30, db_treatment="180+step",
+    )
+    clash = generator.molecule_from_coordinates(generator.generate(8)[2][0])
+    perceived = evaluate_molecules_rdkit([clash], "uff", threads=1)[0].properties["energy"]
+    evaluator = RDKitEvaluator(forcefield="uff", threads=1)
+    evaluator.bind_connectivity(seed)
+    fixed = evaluator.score([clash])[0].properties["energy"]
+    optimized = evaluator.optimize([clash], max_iters=500)[0]
+    assert perceived < 1e6
+    assert fixed > 1e8
+    assert optimized.properties["energy"] < 200
+    radii = {"H": 0.31, "C": 0.76, "N": 0.71, "O": 0.66}
+    vdw = {"H": 1.20, "C": 1.70, "N": 1.55, "O": 1.52}
+    atoms = optimized.atoms
+    for i in range(len(seed.atoms)):
+        for j in range(i + 1, len(seed.atoms)):
+            length = atoms[i].distance_to(atoms[j])
+            seed_length = seed.atoms[i].distance_to(seed.atoms[j])
+            cap = (radii[seed.atoms[i].element] + radii[seed.atoms[j].element]) * 1.2
+            if seed_length < cap:
+                assert length <= cap
+            else:
+                assert length >= 0.6 * (vdw[atoms[i].element] + vdw[atoms[j].element])
 
 
 def test_evaluator_configuration_uses_pydantic_validation():

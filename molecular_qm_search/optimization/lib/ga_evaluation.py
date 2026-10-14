@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import math
-from typing import Callable, Protocol
+import time
+from pathlib import Path
+from typing import Callable, Optional, Protocol
 
 from molecular_qm_models import Molecule, MoleculeList
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from molecular_qm_search.optimization.models.ga_models import GAOptimizationMethod
 
@@ -42,25 +45,157 @@ def validate_results(inputs: list[Molecule], results: list[Molecule]) -> list[Mo
     return results
 
 
+def _agent_debug(hypothesis: str, message: str, data: dict) -> None:
+    # #region agent log
+    row = {
+        "sessionId": "2d4a99",
+        "hypothesisId": hypothesis,
+        "location": "ga_evaluation.py",
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with Path(r"C:\Users\bj7610\WebstormProjects\simstack_ui-ww-new-features\debug-2d4a99.log").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(json.dumps(row) + "\n")
+    except OSError:
+        return
+    # #endregion
+
+
 class RDKitEvaluator(BaseModel):
     forcefield: str = "mmff"
     threads: int = Field(default=0, ge=0)
+    _connectivity: Optional[Molecule] = PrivateAttr(default=None)
+    _bond_template: object = PrivateAttr(default=None)
+
+    def bind_connectivity(self, molecule: Molecule) -> None:
+        """Score later conformers on this molecule's bonds, not a distance guess."""
+        if molecule is None or not molecule.atoms:
+            raise ValueError("RDKit evaluation requires the input molecule's connectivity")
+        self._connectivity = molecule
+        self._bond_template = None
 
     def score(self, molecules: list[Molecule]) -> list[Molecule]:
-        from molecular_qm_util import evaluate_molecules_rdkit
+        if self._connectivity is None:
+            from molecular_qm_util import evaluate_molecules_rdkit
 
-        return evaluate_molecules_rdkit(molecules, self.forcefield, threads=self.threads)
+            return evaluate_molecules_rdkit(molecules, self.forcefield, threads=self.threads)
+        return self._evaluate_on_connectivity(molecules, optimize=False, max_iters=500)
 
     def optimize(self, molecules: list[Molecule], *, max_iters: int) -> list[Molecule]:
-        from molecular_qm_util import evaluate_molecules_rdkit
+        if self._connectivity is None:
+            from molecular_qm_util import evaluate_molecules_rdkit
 
-        return evaluate_molecules_rdkit(
-            molecules,
-            self.forcefield,
-            optimize=True,
-            max_iters=max_iters,
-            threads=self.threads,
-        )
+            return evaluate_molecules_rdkit(
+                molecules,
+                self.forcefield,
+                optimize=True,
+                max_iters=max_iters,
+                threads=self.threads,
+            )
+        return self._evaluate_on_connectivity(molecules, optimize=True, max_iters=max_iters)
+
+    def _template(self):
+        if self._bond_template is None:
+            from molecular_qm_util.rdkit_scripts.rdkit_optimize import molecule_to_rdkit
+
+            self._bond_template = molecule_to_rdkit(self._connectivity)
+        return self._bond_template
+
+    def _evaluate_on_connectivity(self, molecules, *, optimize: bool, max_iters: int):
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from rdkit.Geometry import Point3D
+
+        template = self._template()
+        name = self.forcefield.lower().removeprefix("rdkit_")
+        name = "mmff94" if name == "mmff" else name
+        if name not in {"uff", "mmff94", "mmff94s"}:
+            raise ValueError(f"Unsupported force field: {self.forcefield!r}")
+
+        def bonds_of(rdkit_mol):
+            found = set()
+            for bond in rdkit_mol.GetBonds():
+                begin, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+                found.add((min(begin, end), max(begin, end)))
+            return found
+
+        seed_bonds = bonds_of(template)
+
+        def evaluate(molecule: Molecule) -> Molecule:
+            if len(molecule.atoms) != template.GetNumAtoms():
+                raise ValueError(
+                    f"Conformer has {len(molecule.atoms)} atoms; the input molecule has {template.GetNumAtoms()}"
+                )
+            rdkit_mol = Chem.Mol(template)
+            conformer = rdkit_mol.GetConformer()
+            for index, atom in enumerate(molecule.atoms):
+                if rdkit_mol.GetAtomWithIdx(index).GetSymbol() != atom.element:
+                    raise ValueError(
+                        f"Atom {index + 1} is {atom.element} in the conformer and "
+                        f"{rdkit_mol.GetAtomWithIdx(index).GetSymbol()} in the input molecule"
+                    )
+                conformer.SetAtomPosition(index, Point3D(float(atom.x), float(atom.y), float(atom.z)))
+            if name == "uff":
+                if not AllChem.UFFHasAllMoleculeParams(rdkit_mol):
+                    raise ValueError("UFF parameters are unavailable for this molecule")
+                force_field = AllChem.UFFGetMoleculeForceField(rdkit_mol)
+            else:
+                variant = "MMFF94s" if name == "mmff94s" else "MMFF94"
+                properties = AllChem.MMFFGetMoleculeProperties(rdkit_mol, mmffVariant=variant)
+                if properties is None:
+                    raise ValueError(f"{variant} parameters are unavailable for this molecule")
+                force_field = AllChem.MMFFGetMoleculeForceField(rdkit_mol, properties)
+            if force_field is None:
+                raise ValueError(f"Cannot construct {name} force field")
+            force_field.Initialize()
+            status = force_field.Minimize(maxIts=int(max_iters)) if optimize else None
+            result = Molecule.from_molecule(molecule)
+            result.properties = copy.deepcopy(molecule.properties)
+            result.properties.pop("rank_id", None)
+            result.properties.pop("optimization_converged", None)
+            if optimize:
+                for index, atom in enumerate(result.atoms):
+                    position = conformer.GetAtomPosition(index)
+                    atom.position = [position.x, position.y, position.z]
+                result.properties["optimization_converged"] = status == 0
+            result.properties.update(
+                energy=float(force_field.CalcEnergy()),
+                energy_unit="kcal/mol",
+                method=f"rdkit+{name}",
+            )
+            return result
+
+        if not molecules:
+            return []
+        workers = self.threads or max(1, (os.cpu_count() or 1) // 2)
+        with ThreadPoolExecutor(max_workers=min(workers, len(molecules))) as executor:
+            results = list(executor.map(evaluate, molecules))
+
+        # #region agent log
+        from molecular_qm_util.rdkit_scripts.rdkit_optimize import molecule_to_rdkit
+
+        mismatches = 0
+        for molecule in molecules:
+            perceived = bonds_of(molecule_to_rdkit(molecule))
+            if perceived != seed_bonds:
+                mismatches += 1
+        _agent_debug("A", "RDKit evaluation on the input bond graph", {
+            "optimize": optimize,
+            "conformers": len(results),
+            "bond_graph_mismatches": mismatches,
+            "seed_bonds": len(seed_bonds),
+            "min_energy": min(float(item.properties["energy"]) for item in results),
+            "max_energy": max(float(item.properties["energy"]) for item in results),
+        })
+        # #endregion
+        return results
 
 
 class CallableEvaluator(BaseModel):
