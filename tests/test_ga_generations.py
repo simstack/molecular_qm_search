@@ -58,7 +58,7 @@ def test_three_generations_start_from_the_input(molecule, coordinates, tmp_path,
     assert len(lists) == 3
     assert np.allclose(_positions(molecule), original)
     first_generation = list(lists[0])
-    assert len(first_generation) == GA_INSPECTION_POP_SIZE
+    assert len(first_generation) == 1
     assert np.allclose(_positions(first_generation[0]), original)
     assert first_generation[0].properties["generation"] == 0
     assert first_generation[0].properties["origin"] == "initial"

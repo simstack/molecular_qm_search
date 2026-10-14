@@ -31,6 +31,13 @@ def plot_conformer_diversity(conformers: MoleculeList, output_prefix: str = "") 
     pass
 
 
+_COVALENT_RADII = {
+    "H": 0.31, "He": 0.28,
+    "Li": 1.28, "Be": 0.96, "B": 0.84, "C": 0.76, "N": 0.71, "O": 0.66, "F": 0.57, "Ne": 0.58,
+    "Na": 1.66, "Mg": 1.41, "Al": 1.21, "Si": 1.11, "P": 1.07, "S": 1.05, "Cl": 1.02,
+}
+
+
 def _to_molecule_list(molecules) -> MoleculeList:
     """Collect an iterable of qm_models ``Molecule`` objects into a ``MoleculeList``."""
     mol_list = MoleculeList()
@@ -115,6 +122,8 @@ class BaseGA:
                 f"rotatable_bond_max ({rotatable_bond_max}) must be greater than "
                 f"rotatable_bond_min ({rotatable_bond_min})"
             )
+        self._bonded_pairs = None
+        self._conformation_rows: List[Dict[str, Union[int, float, str]]] = []
         self.evaluator = evaluator if evaluator is not None else make_evaluator(
             optimization_method, parallel_children=parallel_children,
             backend_options=backend_options,
@@ -215,7 +224,86 @@ class BaseGA:
             'DB' if c.bond_type == InternalCoordinateBondType.DOUBLE else 'SB'
             for c in self.template_coords.elements
         ]
+        self._bonded_pairs = self._bonds_of(self.initial_mol)
         self.timing["Setup"] = time.perf_counter() - t0
+
+    def _covalent_radius(self, element: str) -> float:
+        if element not in _COVALENT_RADII:
+            raise ValueError(f"No covalent radius for element {element}")
+        return _COVALENT_RADII[element]
+
+    def _bonds_of(self, molecule: Molecule):
+        atoms = molecule.atoms
+        bonded = set()
+        for i in range(len(atoms)):
+            radius_i = self._covalent_radius(atoms[i].element)
+            for j in range(i + 1, len(atoms)):
+                radius_j = self._covalent_radius(atoms[j].element)
+                if atoms[i].distance_to(atoms[j]) < (radius_i + radius_j) * 1.2:
+                    bonded.add((i, j))
+        return bonded
+
+    def _overlapping_atoms(self, molecule: Molecule):
+        """Return a description when two atoms that are not bonded in the seed occupy the same space."""
+        if self._bonded_pairs is None:
+            raise ValueError("Overlap checks require the seed bond graph")
+        atoms = molecule.atoms
+        if len(atoms) != len(self.initial_mol.atoms):
+            raise ValueError(
+                f"Conformer has {len(atoms)} atoms; the seed has {len(self.initial_mol.atoms)}"
+            )
+        worst = None
+        for i in range(len(atoms)):
+            radius_i = self._covalent_radius(atoms[i].element)
+            for j in range(i + 1, len(atoms)):
+                if (i, j) in self._bonded_pairs:
+                    continue
+                radius_j = self._covalent_radius(atoms[j].element)
+                distance = atoms[i].distance_to(atoms[j])
+                limit = radius_i + radius_j
+                if distance < limit and (worst is None or distance < worst[0]):
+                    worst = (distance, i, atoms[i].element, j, atoms[j].element, limit)
+        if worst is None:
+            return None
+        distance, i, element_i, j, element_j, limit = worst
+        return (
+            f"{element_i}{i} and {element_j}{j} are {distance:.3f} A apart, "
+            f"inside the covalent limit {limit:.3f} A"
+        )
+
+    def _exclude_overlaps(self, population):
+        kept = []
+        for coords, origin, energy in population:
+            if energy is not None:
+                kept.append((coords, origin, energy))
+                continue
+            overlap = self._overlapping_atoms(self.molecule_from_coordinates(coords))
+            if overlap is None:
+                kept.append((coords, origin, energy))
+                continue
+            self._report(
+                f"Excluded {origin} conformer because {overlap}. "
+                "Overlapping atoms score positive infinity and leave the population."
+            )
+        return kept
+
+    def _remember_conformation_energies(self, population) -> None:
+        ordered = sorted(population, key=lambda item: (float(item[2]), item[1]))
+        self._conformation_rows = [
+            {
+                "conformation": index + 1,
+                "energy": float(energy),
+                "origin": origin,
+            }
+            for index, (_, origin, energy) in enumerate(ordered)
+        ]
+
+    def _attach_conformation_table(self, chart) -> None:
+        if not self._conformation_rows:
+            return
+        chart.options = {
+            "conformations": [dict(row) for row in self._conformation_rows],
+        }
 
     def evaluate_population(self, population: List[InternalCoordinatesList]) -> List[Tuple[float, InternalCoordinatesList]]:
         molecules = [self.molecule_from_coordinates(ind) for ind in population]
@@ -350,7 +438,7 @@ class BaseGA:
                 raise ValueError("Parent conformer has no finite energy")
             parents.append((coords, origin, float(energy)))
         proposed = self.reproduce(parents, len(parents) + self.pop_size)
-        children = proposed[len(parents):]
+        children = self._exclude_overlaps(proposed[len(parents):])
         child_scored = []
         if children:
             scored = self.evaluate_population([coords for coords, _, _ in children])
@@ -447,6 +535,7 @@ class BaseGA:
         if isinstance(chart, ChartArtifactModel):
             chart.data = data
             chart.series = series
+            self._attach_conformation_table(chart)
             return
         self.node_runner.energy_chart = ChartArtifactModel(
             data=data,
@@ -458,6 +547,7 @@ class BaseGA:
             ],
             legend=AGChartLegendConfig(enabled=True, position="right"),
         )
+        self._attach_conformation_table(self.node_runner.energy_chart)
 
     def _publish_energy_histogram(self, energies: List[float]) -> None:
         if not energies:
@@ -495,6 +585,7 @@ class BaseGA:
         if isinstance(chart, ChartArtifactModel):
             chart.data = bins
             chart.series = series
+            self._attach_conformation_table(chart)
             return
         self.node_runner.energy_histogram = ChartArtifactModel(
             data=bins,
@@ -506,6 +597,7 @@ class BaseGA:
             ],
             legend=AGChartLegendConfig(enabled=False),
         )
+        self._attach_conformation_table(self.node_runner.energy_histogram)
 
     def _publish_diversity_chart(self, population: List[InternalCoordinatesList]) -> None:
         if len(population) < 2:
@@ -559,6 +651,7 @@ class BaseGA:
             chart.title = title
             chart.data = points
             chart.series = series
+            self._attach_conformation_table(chart)
             return
         self.node_runner.diversity_chart = ChartArtifactModel(
             data=points,
@@ -570,6 +663,7 @@ class BaseGA:
             ],
             legend=AGChartLegendConfig(enabled=False),
         )
+        self._attach_conformation_table(self.node_runner.diversity_chart)
 
     def _publish_dihedral_histograms(self, population: List[InternalCoordinatesList]) -> None:
         if not population:
@@ -630,7 +724,7 @@ class BaseGA:
                 chart.data = bins
                 chart.series = series
             else:
-                setattr(self.node_runner, name, ChartArtifactModel(
+                chart = ChartArtifactModel(
                     data=bins,
                     title=title,
                     series=series,
@@ -639,7 +733,9 @@ class BaseGA:
                         AGChartAxisConfig(type="number", position="left", title="count"),
                     ],
                     legend=AGChartLegendConfig(enabled=False),
-                ))
+                )
+                setattr(self.node_runner, name, chart)
+            self._attach_conformation_table(chart)
             if name not in self._dihedral_histogram_names:
                 self._dihedral_histogram_names.append(name)
 
@@ -683,8 +779,10 @@ class BaseGA:
 
     def _publish_run_report(self, molecules: List[Molecule]) -> None:
         self._publish_energy_chart()
+        if not self._conformation_rows:
+            raise ValueError("GA produced no conformation energies")
         self._publish_energy_histogram([
-            float(molecule.properties["energy"]) for molecule in molecules
+            float(row["energy"]) for row in self._conformation_rows
         ])
         if self.population_generator is None:
             raise ValueError("Cannot measure dihedral histograms before the population generator exists")
@@ -722,6 +820,7 @@ class BaseGA:
         self._report("\n--- GA Parameters ---")
         self._report(f"Atoms:          {len(self.initial_mol.atoms)}")
         self._report(f"Population:     {self.pop_size}")
+        self._report("Seed:           input geometry only")
         self._report(f"Generations:    {self.generations}")
         self._report(f"Mutation Rate:  {self.mutation_rate}")
         self._report(f"Crossover Rate: {1 - self.mutation_rate}")
@@ -760,6 +859,15 @@ class BaseGA:
         if not self.template_coords.elements:
             self._report("No rotatable bonds found.")
             evaluated = self.evaluate_molecules([self.initial_mol], optimize=True)
+            ordered = sorted(evaluated, key=lambda molecule: float(molecule.properties["energy"]))
+            self._conformation_rows = [
+                {
+                    "conformation": index + 1,
+                    "energy": float(molecule.properties["energy"]),
+                    "origin": "initial",
+                }
+                for index, molecule in enumerate(ordered)
+            ]
             self._record_energy_iteration(0, [mol.properties["energy"] for mol in evaluated])
             molecules = self._ranked_population(evaluated, limit=self.num_confs)
             self._publish_run_report(list(molecules))
@@ -774,10 +882,17 @@ class BaseGA:
                 start_gen += 1  # Start from the next generation
 
         if population is None:
-            population = self.population_generator.generate(self.pop_size)
+            population = self.population_generator.generate(1)
+            self._report(
+                "Seed population: the input geometry alone. "
+                "Later conformers come from mutation and crossover."
+            )
 
         t1 = time.perf_counter()
         for gen in range(start_gen, self.generations + 1):
+            population = self._exclude_overlaps(population)
+            if not population:
+                raise ValueError(f"Generation {gen} has no conformers after excluding overlaps")
             pending = [index for index, (_, _, energy) in enumerate(population) if energy is None]
             if pending:
                 scored_pop = self.evaluate_population([population[index][0] for index in pending])
@@ -796,6 +911,7 @@ class BaseGA:
                     raise ValueError("Population conformer has no finite energy")
                 energies.append(energy)
                 scored_coords.append(coords)
+            self._remember_conformation_energies(population)
             self._record_energy_iteration(gen, energies)
             self._publish_energy_chart()
             self._publish_energy_histogram(energies)

@@ -228,7 +228,9 @@ class PopulationGenerator:
         while len(population) < target_size:
             if rejected >= child_quota:
                 break
-            if self.random.random() < self.mutation_rate:
+            if len(parents) < 2 and self.mutation_rate == 0:
+                raise ValueError("Crossover requires two parents")
+            if self.random.random() < self.mutation_rate or len(parents) < 2:
                 donor = copy.deepcopy(self.random.choice(parents)[0])
                 if n_coords == 0:
                     child, origin = None, None
@@ -246,8 +248,6 @@ class PopulationGenerator:
                             raise ValueError(f"Mutated coordinate has no bond type: {coord.bond_type!r}")
                         child, origin = donor, f"mutation-{coord.bond_type.value}"
             else:
-                if len(parents) < 2:
-                    raise ValueError("Crossover requires two parents")
                 if n_coords == 0:
                     child, origin = None, None
                 else:

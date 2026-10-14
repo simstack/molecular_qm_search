@@ -236,6 +236,7 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
     conformers = ga.run()
     assert len(conformers) == 6
     assert "Population:     12" in runner.log_string
+    assert "Seed population: the input geometry alone" in runner.log_string
     assert "Dihedral Types:" in runner.log_string
     assert runner.log_string == "\n".join(runner.info_messages) + "\n"
     chart = runner.energy_chart
@@ -255,7 +256,13 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
     histogram = runner.energy_histogram
     assert histogram.series[0].type == "column"
     assert histogram.series[0].yKey == "count"
-    assert sum(row["count"] for row in histogram.data) == len(conformers)
+    rows = histogram.options["conformations"]
+    assert [row["energy"] for row in rows] == sorted(row["energy"] for row in rows)
+    assert [row["conformation"] for row in rows] == list(range(1, len(rows) + 1))
+    assert sum(row["count"] for row in histogram.data) == len(rows)
+    assert chart.data[-1]["min-energy"] == rows[0]["energy"]
+    assert chart.data[-1]["max-energy"] == rows[-1]["energy"]
+    assert chart.options["conformations"] == rows
     assert runner.diversity_chart.series[0].type == "scatter"
     assert len(runner.diversity_chart.data) == 12
     assert {key for row in runner.diversity_chart.data for key in row} == {"pc1", "pc2"}
@@ -270,10 +277,11 @@ def test_charts_refresh_on_every_iteration(molecule, coordinates, tmp_path, monk
         def score(self, molecules):
             chart = getattr(runner, "energy_chart", None)
             if chart is not None:
+                diversity = getattr(runner, "diversity_chart", None)
                 seen.append({
                     "iterations": [row["iteration"] for row in chart.data],
                     "histogram": sum(row["count"] for row in runner.energy_histogram.data),
-                    "diversity": len(runner.diversity_chart.data),
+                    "diversity": None if diversity is None else len(diversity.data),
                 })
             return super().score(molecules)
 
@@ -283,7 +291,7 @@ def test_charts_refresh_on_every_iteration(molecule, coordinates, tmp_path, monk
     )
     ga.run()
     assert seen == [
-        {"iterations": [0], "histogram": 4, "diversity": 4},
+        {"iterations": [0], "histogram": 1, "diversity": None},
         {"iterations": [0, 1], "histogram": 4, "diversity": 4},
         {"iterations": [0, 1, 2], "histogram": 4, "diversity": 4},
         {"iterations": [0, 1, 2], "histogram": 4, "diversity": 4},
@@ -352,7 +360,7 @@ def test_later_generations_score_only_new_conformers(molecule, coordinates, tmp_
     )
     ga.run()
     score_sizes = [call[1] for call in evaluator.calls if call[0] == "score"]
-    assert score_sizes == [5, 5, 5]
+    assert score_sizes == [1, 5, 5]
 
 
 def test_noop_mutations_do_not_shrink_the_population_cap(molecule, coordinates, tmp_path, monkeypatch):
@@ -488,6 +496,42 @@ def test_archive_drops_duplicate_dihedrals(molecule, coordinates, tmp_path, monk
     folded = copy.deepcopy(ga.template_coords)
     ga.post_generation_hook([folded, copy.deepcopy(folded)], 1)
     assert len(list(ga.best_stored)) == 1
+
+
+def test_overlapping_conformer_is_excluded_and_not_scored(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    evaluator = Evaluator()
+    runner = RecordingRunner()
+    ga = StandardGA(
+        molecule, runner, evaluator=evaluator, coordinates=coordinates,
+        pop_size=2, num_confs=2, generations=0, mutation_rate=1.0,
+    )
+    ga.setup()
+    assert ga._overlapping_atoms(molecule) is None
+    overlapped = Molecule.from_molecule(molecule)
+    overlapped.atoms[3].x = overlapped.atoms[0].x
+    overlapped.atoms[3].y = overlapped.atoms[0].y
+    overlapped.atoms[3].z = overlapped.atoms[0].z
+    overlap = ga._overlapping_atoms(overlapped)
+    assert overlap is not None
+    assert "C1 and C3" in overlap
+    original = ga.molecule_from_coordinates
+
+    def collide(coords):
+        built = original(coords)
+        if coords is bad:
+            built.atoms[3].x = built.atoms[0].x
+            built.atoms[3].y = built.atoms[0].y
+            built.atoms[3].z = built.atoms[0].z
+        return built
+
+    good = copy.deepcopy(ga.template_coords)
+    bad = copy.deepcopy(ga.template_coords)
+    ga.molecule_from_coordinates = collide
+    kept = ga._exclude_overlaps([(good, "initial", None), (bad, "mutation-single", None)])
+    assert kept == [(good, "initial", None)]
+    assert evaluator.calls == []
+    assert "positive infinity" in runner.log_string
 
 
 @pytest.mark.parametrize("ga_class", [StandardGA, MinimizingGA, DiversityGA])
