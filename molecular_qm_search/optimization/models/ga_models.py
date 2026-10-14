@@ -89,7 +89,8 @@ class GAConfig(Model):
             "when one is closer than this to a parent or another child. "
             "Parents and surviving children are sorted by energy and cut at pop_size. "
             "The live population can grow back up to pop_size. "
-            "num_confs caps only the returned list."
+            "The standard GA returns that population without UFF relaxation. "
+            "num_confs caps the returned list of ga-min and ga-select."
         ),
     )
     db_treatment: DoubleBondTreatment = Field(
@@ -177,7 +178,8 @@ class GAConformerParameters(Model):
             "when one is closer than this to a parent or another child. "
             "Parents and surviving children are sorted by energy and cut at pop_size. "
             "The live population can grow back up to pop_size. "
-            "num_confs caps only the returned list."
+            "The standard GA returns that population without UFF relaxation. "
+            "num_confs caps the returned list of ga-min and ga-select."
         ),
     )
     db_treatment: DoubleBondTreatment = Field(

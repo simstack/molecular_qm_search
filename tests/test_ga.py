@@ -155,12 +155,17 @@ def test_modes_use_injected_backend_and_preserve_final_geometry(
     assert evaluator.calls == []
     result = ga.run()
     assert result
-    assert any(call[0] == "optimize" for call in evaluator.calls)
-    assert all(m.atoms[0].y == 2.5 for m in result)
-    assert all(m.properties["energy"] == -2 for m in result)
-    assert all(m.properties["method"] == "test" for m in result)
-    if ga_class is not MinimizingGA:
+    if ga_class is StandardGA:
+        assert all(call[0] != "optimize" for call in evaluator.calls)
         assert any(call[0] == "score" for call in evaluator.calls)
+        assert all(m.properties["energy"] == 5.0 for m in result)
+    else:
+        assert any(call[0] == "optimize" for call in evaluator.calls)
+        assert all(m.atoms[0].y == 2.5 for m in result)
+        assert all(m.properties["energy"] == -2 for m in result)
+        assert all(m.properties["method"] == "test" for m in result)
+        if ga_class is not MinimizingGA:
+            assert any(call[0] == "score" for call in evaluator.calls)
 
 
 def test_rigid_molecule_uses_backend_without_rdkit(molecule, tmp_path, monkeypatch):
@@ -169,7 +174,7 @@ def test_rigid_molecule_uses_backend_without_rdkit(molecule, tmp_path, monkeypat
     ga = StandardGA(molecule, logging.getLogger("test"), evaluator=evaluator,
                     coordinates=InternalCoordinatesList())
     assert len(ga.run()) == 1
-    assert evaluator.calls == [("optimize", 1, 500)]
+    assert evaluator.calls == [("score", 1)]
 
 
 def test_smart_optimization_preserves_order_and_partial_results(molecule, coordinates):
@@ -234,7 +239,10 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
         pop_size=12, num_confs=6, generations=2, mutation_rate=1.0, seed=1,
     )
     conformers = ga.run()
-    assert len(conformers) == 6
+    assert len(conformers) == 12
+    assert [float(molecule.properties["energy"]) for molecule in conformers] == [
+        row["energy"] for row in runner.conformation_energies.row
+    ]
     assert "Population:     12" in runner.log_string
     assert "Seed population: the input geometry alone" in runner.log_string
     assert "at or above prune_rms_thresh" in runner.log_string
@@ -298,7 +306,6 @@ def test_charts_refresh_on_every_iteration(molecule, coordinates, tmp_path, monk
     assert seen == [
         {"iterations": [0], "histogram": 4, "diversity": 4},
         {"iterations": [0, 1], "histogram": 4, "diversity": 4},
-        {"iterations": [0, 1, 2], "histogram": 4, "diversity": 4},
     ]
     assert [row["iteration"] for row in runner.energy_chart.data] == [0, 1, 2]
 
@@ -379,7 +386,7 @@ def test_noop_mutations_do_not_shrink_the_population_cap(molecule, coordinates, 
     assert 1 <= len(result) <= 4
     assert "rejected 4 with no dihedral change" in runner.log_string
     assert "maximum pop_size 4" in runner.log_string
-    assert "num_confs caps only the returned list" in runner.log_string
+    assert "num_confs caps the returned list of ga-min and ga-select" in runner.log_string
 
 
 def test_wide_rmsd_threshold_drops_conformers_and_says_so(molecule, coordinates, tmp_path, monkeypatch):
@@ -440,9 +447,11 @@ def test_num_confs_caps_only_the_returned_list(molecule, coordinates, tmp_path, 
     ga.post_generation_hook = lambda population, gen: seen.append(len(population))
     result = list(ga.run())
     assert seen == [3]
-    assert len(result) == 1
+    assert len(result) == 3
     assert ga.pop_size == 3
-    assert runner.log_string.count("Stopped at num_confs") == 1
+    assert "UFF relaxation is not applied" in runner.log_string
+    assert "returning 3" in runner.log_string
+    assert "Stopped at num_confs" not in runner.log_string
 
 
 def test_relaxation_into_one_well_does_not_drop_the_population(molecule, coordinates, tmp_path, monkeypatch):
@@ -468,7 +477,8 @@ def test_relaxation_into_one_well_does_not_drop_the_population(molecule, coordin
     )
     result = list(ga.run())
     assert len(result) == 3
-    assert "Dihedral RMSD is not applied after relaxation" in runner.log_string
+    assert all(call[0] != "optimize" for call in ga.evaluator.calls)
+    assert "UFF relaxation is not applied" in runner.log_string
     assert "returning 3" in runner.log_string
 
 

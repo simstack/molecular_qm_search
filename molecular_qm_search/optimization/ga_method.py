@@ -891,10 +891,11 @@ class BaseGA:
             f"({self.prune_rms_thresh} degrees dihedral RMSD) of a parent or another child. "
             "Parents and surviving children are combined, sorted by energy, and cut at "
             "pop_size. The live population can grow back up to pop_size; the maximum does "
-            "not shrink. num_confs caps only the returned list. "
-            "The standard GA does not apply dihedral RMSD again after the final relaxation. "
-            "ga-min compares optimized geometries, so starts that relax into one well "
-            "collapse here. ga-select also drops conformers above "
+            "not shrink. The standard GA returns every conformer that survived the last "
+            "selection, with the single-point energy used during the search, and does not "
+            "relax those geometries. num_confs caps the returned list of ga-min and "
+            "ga-select. ga-min compares optimized geometries, so starts that relax into "
+            "one well collapse there. ga-select also drops conformers above "
             "min energy + 0.1*|min energy| before breeding."
         )
         self._report(f"Rotatable Bonds: {len(self.template_coords.elements)}")
@@ -904,7 +905,9 @@ class BaseGA:
 
         if not self.template_coords.elements:
             self._report("No rotatable bonds found.")
-            evaluated = self.evaluate_molecules([self.initial_mol], optimize=True)
+            evaluated = self.evaluate_molecules(
+                [self.initial_mol], optimize=type(self) is not StandardGA,
+            )
             ordered = sorted(evaluated, key=lambda molecule: float(molecule.properties["energy"]))
             self._conformation_rows = [
                 {
@@ -978,9 +981,10 @@ class BaseGA:
         self.timing["GA Loop"] = time.perf_counter() - t1
         molecules = self.finalize(population)
         returned = list(molecules)
-        if not 1 <= len(returned) <= self.num_confs:
+        cap = self.pop_size if type(self) is StandardGA else self.num_confs
+        if not 1 <= len(returned) <= cap:
             raise ValueError(
-                f"Expected between 1 and {self.num_confs} population molecules, got {len(returned)}"
+                f"Expected between 1 and {cap} population molecules, got {len(returned)}"
             )
         self._publish_run_report(returned)
         return molecules
@@ -1023,41 +1027,21 @@ class StandardGA(BaseGA):
     """Score generated geometries; optimize only the final population."""
 
     def finalize(self, population) -> MoleculeList:
-        molecules = [self.molecule_from_coordinates(coords) for coords, _, _ in population]
-        optimized = self.evaluate_molecules(molecules, optimize=True)
-        if optimized:
-            self.best_energy_seen = min(m.properties["energy"] for m in optimized)
-        # #region agent log
-        from molecular_qm_search.optimization.lib.ga_evaluation import _agent_debug
-
-        overlaps = [self._overlapping_atoms(molecule) for molecule in optimized]
-        _agent_debug("B", "final UFF population", {
-            "returned_before_prune": len(optimized),
-            "overlaps": sum(item is not None for item in overlaps),
-            "first_overlap": next((item for item in overlaps if item is not None), None),
-            "energies": [round(float(molecule.properties["energy"]), 3) for molecule in optimized[:8]],
-        })
-        # #endregion
-        ranked = sorted(optimized, key=lambda molecule: float(molecule.properties["energy"]))
-        for molecule in ranked:
-            energy = molecule.properties.get("energy")
+        ordered = sorted(population, key=lambda item: (float(item[2]), item[1]))
+        molecules = []
+        for coords, _, energy in ordered:
             if energy is None or not np.isfinite(float(energy)):
                 raise ValueError("Population molecule has no finite energy")
-        kept = ranked[:self.num_confs]
-        omitted = len(ranked) - len(kept)
-        if omitted:
-            cap_note = (
-                f"Stopped at num_confs {self.num_confs}; "
-                f"{omitted} higher-energy conformers were not returned."
-            )
-        else:
-            cap_note = f"num_confs {self.num_confs} does not remove any conformer."
+            molecule = self.molecule_from_coordinates(coords)
+            molecule.properties["energy"] = float(energy)
+            molecule.properties["energy_unit"] = "kcal/mol"
+            molecules.append(molecule)
+        self.best_energy_seen = molecules[0].properties["energy"]
         self._report(
-            f"Final population: {len(ranked)} optimized conformers, returning {len(kept)}. "
-            "Dihedral RMSD is not applied after relaxation. "
-            f"{cap_note}"
+            f"Final population: {len(molecules)} conformers scored before UFF relaxation, "
+            f"returning {len(molecules)}. UFF relaxation is not applied."
         )
-        return _to_molecule_list(kept)
+        return _to_molecule_list(molecules)
 
 
 class MinimizingGA(BaseGA):
