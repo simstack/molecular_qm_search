@@ -445,6 +445,33 @@ def test_num_confs_caps_only_the_returned_list(molecule, coordinates, tmp_path, 
     assert runner.log_string.count("Stopped at num_confs") == 1
 
 
+def test_relaxation_into_one_well_does_not_drop_the_population(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    class SameGeometryEvaluator(Evaluator):
+        def optimize(self, molecules, *, max_iters):
+            self.calls.append(("optimize", len(molecules), max_iters))
+            results = []
+            for index, source in enumerate(molecules):
+                result = Molecule.from_molecule(source)
+                for atom, template in zip(result.atoms, molecule.atoms):
+                    atom.x, atom.y, atom.z = template.x, template.y, template.z
+                result.properties.update(energy=float(index), energy_unit="kcal/mol", method="test")
+                results.append(result)
+            return results
+
+    runner = RecordingRunner()
+    ga = StandardGA(
+        molecule, runner, evaluator=SameGeometryEvaluator(), coordinates=coordinates,
+        pop_size=3, num_confs=3, generations=0, mutation_rate=1.0,
+        dihedral_interval=40, seed=1,
+    )
+    result = list(ga.run())
+    assert len(result) == 3
+    assert "Dihedral RMSD is not applied after relaxation" in runner.log_string
+    assert "returning 3" in runner.log_string
+
+
 def test_crossover_requires_two_parents(molecule, coordinates):
     generator = PopulationGenerator(molecule, coordinates=coordinates, mutation_rate=0)
     with pytest.raises(ValueError, match="two parents"):

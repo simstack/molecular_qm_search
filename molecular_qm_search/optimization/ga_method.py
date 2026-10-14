@@ -873,6 +873,7 @@ class BaseGA:
             "Parents and surviving children are combined, sorted by energy, and cut at "
             "pop_size. The live population can grow back up to pop_size; the maximum does "
             "not shrink. num_confs caps only the returned list. "
+            "The standard GA does not apply dihedral RMSD again after the final relaxation. "
             "ga-min compares optimized geometries, so starts that relax into one well "
             "collapse here. ga-select also drops conformers above "
             "min energy + 0.1*|min energy| before breeding."
@@ -1015,7 +1016,26 @@ class StandardGA(BaseGA):
             "energies": [round(float(molecule.properties["energy"]), 3) for molecule in optimized[:8]],
         })
         # #endregion
-        return self._ranked_population(optimized, limit=self.num_confs)
+        ranked = sorted(optimized, key=lambda molecule: float(molecule.properties["energy"]))
+        for molecule in ranked:
+            energy = molecule.properties.get("energy")
+            if energy is None or not np.isfinite(float(energy)):
+                raise ValueError("Population molecule has no finite energy")
+        kept = ranked[:self.num_confs]
+        omitted = len(ranked) - len(kept)
+        if omitted:
+            cap_note = (
+                f"Stopped at num_confs {self.num_confs}; "
+                f"{omitted} higher-energy conformers were not returned."
+            )
+        else:
+            cap_note = f"num_confs {self.num_confs} does not remove any conformer."
+        self._report(
+            f"Final population: {len(ranked)} optimized conformers, returning {len(kept)}. "
+            "Dihedral RMSD is not applied after relaxation. "
+            f"{cap_note}"
+        )
+        return _to_molecule_list(kept)
 
 
 class MinimizingGA(BaseGA):
