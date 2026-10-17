@@ -115,8 +115,13 @@ def test_test1_mutation_and_crossover_generate_new_molecules():
         molecule, coordinates=coordinates, seed=2,
         mutation_rate=1.0, dihedral_interval=60.0,
     )
-    parents = mutator.generate(5)
-    mutated = mutator.reproduce(parents, 9, 0.1)
+    history = []
+    parents = []
+    for coords, origin, energy in mutator.generate(5):
+        index = len(history)
+        history.append({"op": "I", "index": index})
+        parents.append((coords, origin, energy, index))
+    mutated = mutator.reproduce(parents, 9, 0.1, history)
     assert [item[1] for item in mutated[:5]] == ["initial"] * 5
     assert all(item[1].startswith("mutation-") for item in mutated[5:])
 
@@ -148,7 +153,7 @@ def test_test1_mutation_and_crossover_generate_new_molecules():
         molecule, coordinates=coordinates, seed=7,
         mutation_rate=0.0, dihedral_interval=60.0,
     )
-    crossed = crosser.reproduce(parents, 10, 0.1)
+    crossed = crosser.reproduce(parents, 10, 0.1, history)
     assert [item[1] for item in crossed[:5]] == ["initial"] * 5
     assert [item[1] for item in crossed[5:]] == ["crossover"] * 5
 

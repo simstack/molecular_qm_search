@@ -12,19 +12,46 @@ from molecular_qm_models.internal_coordinates import (
 )
 
 
-def dihedral_rmsd(left: InternalCoordinatesList, right: InternalCoordinatesList) -> float:
-    """Circular root-mean-square difference of dihedral angles, in degrees."""
+def dihedral_rmsd(
+        left: InternalCoordinatesList,
+        right: InternalCoordinatesList,
+        symmetries=None,
+) -> float:
+    """Circular root-mean-square difference of dihedral angles, in degrees.
+
+    ``symmetries`` has one entry per dihedral. ``None`` is an ordinary torsion.
+    A number is the angle, in degrees, between the two hydrogens of a terminal
+    group such as NH2. Those hydrogens are indistinguishable, so an angle and
+    the same angle plus or minus that shift describe one conformation.
+    """
     if len(left.elements) != len(right.elements):
         raise ValueError(
             f"Dihedral lists differ in length ({len(left.elements)} and {len(right.elements)})"
         )
+    if symmetries is not None and len(symmetries) != len(left.elements):
+        raise ValueError(
+            f"Dihedral symmetries ({len(symmetries)}) do not match the "
+            f"{len(left.elements)} dihedrals"
+        )
     if not left.elements:
         return 0.0
     squares = []
-    for first, second in zip(left.elements, right.elements):
-        difference = abs(first.get_actual_value(first.value) - second.get_actual_value(second.value)) % 360
+    for index, (first, second) in enumerate(zip(left.elements, right.elements)):
+        start = float(first.get_actual_value(first.value))
+        finish = float(second.get_actual_value(second.value))
+        difference = abs(start - finish) % 360
         if difference > 180:
             difference = 360 - difference
+        if symmetries is not None and symmetries[index] is not None:
+            if not math.isfinite(float(symmetries[index])):
+                raise ValueError(f"Dihedral {index} has a non-finite symmetry shift")
+            # The shift is not exactly 180, so the two hydrogens are not inverses
+            # of each other. Both directions map one hydrogen's angle onto the other.
+            for sign in (1.0, -1.0):
+                shifted = abs(start - (finish - sign * float(symmetries[index]))) % 360
+                if shifted > 180:
+                    shifted = 360 - shifted
+                difference = min(difference, shifted)
         squares.append(difference * difference)
     return math.sqrt(sum(squares) / len(squares))
 
@@ -186,17 +213,24 @@ class PopulationGenerator:
             population.append((individual, "initial", None))
         return population
 
-    def reproduce(self, parents, target_size, prune_rms_thresh):
+    def reproduce(self, parents, target_size, prune_rms_thresh, history):
         """Carry parents once and append new mutations or crossovers.
 
-        Each parent is ``(coordinates, origin, energy)``. Added conformers have
-        energy ``None``. A proposal that does not move a dihedral is discarded.
-        Dihedral RMSD is not applied here: the caller scores the children and
-        then keeps the lower-energy conformer of each neighborhood.
+        Each parent is ``(coordinates, origin, energy, history_index)``.
+        ``history`` is the list of operations that created every configuration.
+        A mutation appends ``M`` with the ancestor index, dihedral index, and
+        signed angle in degrees. A crossover appends ``X`` with both ancestor
+        indices and the dihedral index where the second ancestor begins.
+        Added conformers have energy ``None``. A proposal that does not move a
+        dihedral is discarded and is not numbered. Dihedral RMSD is not applied
+        here: the caller scores the children and then keeps the lower-energy
+        conformer of each neighborhood.
         After ``target_size - len(parents)`` discarded proposals in a row, the
         returned population is shorter than requested. ``last_rejection`` is
         ``noop`` when that happens, and ``rejected_rmsd`` stays unset.
         """
+        if not isinstance(history, list):
+            raise ValueError("GA history must be a list")
         if not parents:
             raise ValueError("Cannot reproduce an empty population")
         if target_size < 1:
@@ -211,8 +245,13 @@ class PopulationGenerator:
                 f"Cannot carry {len(parents)} parents into a population of {target_size}"
             )
         for parent in parents:
-            if not isinstance(parent, tuple) or len(parent) != 3:
-                raise ValueError("Parent conformers must carry coordinates, origin, and energy")
+            if not isinstance(parent, tuple) or len(parent) != 4:
+                raise ValueError(
+                    "Parent conformers must carry coordinates, origin, energy, and history index"
+                )
+            ancestor = parent[3]
+            if not isinstance(ancestor, int) or not 0 <= ancestor < len(history):
+                raise ValueError(f"Configuration {ancestor} is not in the GA history")
         population = list(parents)
         self.rejected_rmsd = None
         self.last_rejection = None
@@ -230,12 +269,15 @@ class PopulationGenerator:
                 break
             if len(parents) < 2 and self.mutation_rate == 0:
                 raise ValueError("Crossover requires two parents")
+            operation = None
             if self.random.random() < self.mutation_rate or len(parents) < 2:
-                donor = copy.deepcopy(self.random.choice(parents)[0])
+                parent = self.random.choice(parents)
+                donor = copy.deepcopy(parent[0])
                 if n_coords == 0:
                     child, origin = None, None
                 else:
-                    coord = donor.elements[self.random.randrange(n_coords)]
+                    dihedral_index = self.random.randrange(n_coords)
+                    coord = donor.elements[dihedral_index]
                     delta = self.random.uniform(-self.dihedral_interval, self.dihedral_interval)
                     if (self.db_treatment == "180+step"
                             and coord.bond_type == InternalCoordinateBondType.DOUBLE):
@@ -247,23 +289,40 @@ class PopulationGenerator:
                         if coord.bond_type is None or not hasattr(coord.bond_type, "value"):
                             raise ValueError(f"Mutated coordinate has no bond type: {coord.bond_type!r}")
                         child, origin = donor, f"mutation-{coord.bond_type.value}"
+                        operation = {
+                            "op": "M",
+                            "ancestor": parent[3],
+                            "dihedral": dihedral_index,
+                            "angle": float(delta),
+                        }
             else:
                 if n_coords == 0:
                     child, origin = None, None
                 else:
-                    first, second = self.random.sample([individual[0] for individual in parents], 2)
+                    first, second = self.random.sample(parents, 2)
                     point = self.random.randrange(n_coords)
                     child = InternalCoordinatesList(elements=copy.deepcopy(
-                        first.elements[:point] + second.elements[point:]
+                        first[0].elements[:point] + second[0].elements[point:]
                     ))
                     origin = "crossover"
+                    operation = {
+                        "op": "X",
+                        "a1": first[3],
+                        "a2": second[3],
+                        "cut": point,
+                    }
             if child is None:
                 rejected += 1
                 self.rejected_rmsd = 0.0
                 self.last_rejection = "noop"
                 self.reproduction_stats["rejected_noop"] += 1
                 continue
+            if operation is None:
+                raise ValueError("Created conformer has no history operation")
             rejected = 0
             self.reproduction_stats["accepted"] += 1
-            population.append((child, origin, None))
+            history_index = len(history)
+            operation["index"] = history_index
+            history.append(operation)
+            population.append((child, origin, None, history_index))
         return population

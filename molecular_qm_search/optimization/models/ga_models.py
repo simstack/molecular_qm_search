@@ -81,7 +81,7 @@ class GAConfig(Model):
         ),
     )
     prune_rms_thresh: float = Field(
-        0.1,
+        20.0,
         title="Prune RMSD",
         description=(
             "Minimum dihedral RMSD in degrees between conformers that are both kept. "
@@ -170,7 +170,7 @@ class GAConformerParameters(Model):
         ),
     )
     prune_rms_thresh: float = Field(
-        0.1,
+        20.0,
         title="Prune RMSD",
         description=(
             "Minimum dihedral RMSD in degrees between conformers that are both kept. "

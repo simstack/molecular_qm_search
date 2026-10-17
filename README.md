@@ -113,7 +113,7 @@ energy-window survivors (`ga-select`) are carried once. Open slots are filled
 with a mutation or a crossover. There is no copy operator and no separate
 crossover-rate input: the crossover probability is `1 - mutation_rate`.
 `mutation_rate` of 0 is all crossover, and crossover with fewer than two
-parents raises. A proposed child closer than `prune_rms_thresh` (default 0.1
+parents raises. A proposed child closer than `prune_rms_thresh` (default 20
 degrees) to a conformer already kept is dropped. After `pop_size` such
 rejections in a row the population shrinks to the number kept and the node log
 records the generation, the requested size, the kept size, and the rejected

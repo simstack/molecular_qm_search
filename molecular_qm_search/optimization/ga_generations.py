@@ -25,7 +25,7 @@ class GenerationSnapshotGA(StandardGA):
         if not scored_pop:
             raise ValueError(f"Generation {gen} has no conformers")
         molecules = MoleculeList()
-        for energy, coords, origin in scored_pop:
+        for energy, coords, origin, _history_index in scored_pop:
             conformer = self.molecule_from_coordinates(coords)
             conformer.properties["energy"] = float(energy)
             conformer.properties["origin"] = origin
@@ -65,7 +65,7 @@ def ga_generation_lists(
         mutation_rate=0.5,
         dihedral_interval=30.0,
         seed=1,
-        prune_rms_thresh=0.1,
+        prune_rms_thresh=20.0,
         max_iters=500,
         parallel_children=0,
         smart_opt=False,

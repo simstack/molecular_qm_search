@@ -155,16 +155,63 @@ class RDKitEvaluator(BaseModel):
             if force_field is None:
                 raise ValueError(f"Cannot construct {name} force field")
             force_field.Initialize()
-            status = force_field.Minimize(maxIts=int(max_iters)) if optimize else None
+            # Same force tolerance Minimize uses. RDKit also returns success when the
+            # step collapses, which leaves the raw gradient large.
+            force_tol = 1e-4
+            discarded = False
+            gradient_test = None
+            if optimize:
+                for _attempt in range(3):
+                    force_field.Minimize(maxIts=int(max_iters), forceTol=force_tol, energyTol=1e-6)
+                    raw_gradient = tuple(force_field.CalcGrad())
+                    if any(not math.isfinite(component) for component in raw_gradient):
+                        raise ValueError("Force-field gradient is not finite")
+                    if len(raw_gradient) != conformer.GetNumAtoms() * 3:
+                        raise ValueError(
+                            f"Force field returned {len(raw_gradient)} gradient components "
+                            f"for {conformer.GetNumAtoms()} atoms"
+                        )
+                    scaled = [component * 0.1 for component in raw_gradient]
+                    max_component = max(abs(component) for component in scaled)
+                    grad_scale = 0.1
+                    if max_component > 10.0:
+                        while max_component * grad_scale > 10.0:
+                            grad_scale *= 0.5
+                        scaled = [component * grad_scale for component in scaled]
+                    energy = float(force_field.CalcEnergy())
+                    if not math.isfinite(energy):
+                        raise ValueError("Force-field energy is not finite")
+                    term = max(energy * grad_scale, 1.0)
+                    gradient_test = 0.0
+                    for component_index, component in enumerate(scaled):
+                        position = conformer.GetAtomPosition(component_index // 3)
+                        coordinate = (position.x, position.y, position.z)[component_index % 3]
+                        gradient_test = max(
+                            gradient_test, abs(component) * max(abs(coordinate), 1.0)
+                        )
+                    gradient_test /= term
+                    if not math.isfinite(gradient_test):
+                        raise ValueError("Force-field gradient is not finite")
+                    if gradient_test < force_tol:
+                        break
+                else:
+                    discarded = True
             result = Molecule.from_molecule(molecule)
             result.properties = copy.deepcopy(molecule.properties)
             result.properties.pop("rank_id", None)
             result.properties.pop("optimization_converged", None)
+            result.properties.pop("force_field_discarded", None)
+            result.properties.pop("force_field_gradient", None)
             if optimize:
                 for index, atom in enumerate(result.atoms):
                     position = conformer.GetAtomPosition(index)
                     atom.position = [position.x, position.y, position.z]
-                result.properties["optimization_converged"] = status == 0
+                result.properties["optimization_converged"] = not discarded
+                if discarded:
+                    if gradient_test is None:
+                        raise ValueError("Force-field optimization stopped without a gradient")
+                    result.properties["force_field_discarded"] = True
+                    result.properties["force_field_gradient"] = float(gradient_test)
             result.properties.update(
                 energy=float(force_field.CalcEnergy()),
                 energy_unit="kcal/mol",

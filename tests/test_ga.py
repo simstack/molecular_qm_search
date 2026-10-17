@@ -8,7 +8,7 @@ from molecular_qm_models import Atom, Molecule, InternalCoordinatesList, Interna
 from molecular_qm_models.internal_coordinates import InternalCoordinateBondType
 from molecular_qm_search.optimization.ga_population import PopulationGenerator
 from molecular_qm_search.optimization.ga_method import StandardGA, MinimizingGA, DiversityGA
-from molecular_qm_search.optimization.lib.ga_evaluation import validate_results
+from molecular_qm_search.optimization.lib.ga_evaluation import RDKitEvaluator, validate_results
 
 
 @pytest.fixture
@@ -135,8 +135,10 @@ def test_double_bond_mutation_flips_relative_to_parent(molecule, coordinates):
     coordinates.elements[0].bond_type = InternalCoordinateBondType.DOUBLE
     generator = PopulationGenerator(molecule, coordinates=coordinates, mutation_rate=1,
                                     dihedral_interval=0)
-    parents = generator.generate(1)
-    offspring = generator.reproduce(parents, 2, 0.1)
+    generated = generator.generate(1)
+    history = [{"op": "I", "index": 0}]
+    parents = [(generated[0][0], generated[0][1], generated[0][2], 0)]
+    offspring = generator.reproduce(parents, 2, 0.1, history)
     before = parents[0][0].elements[0].value
     after = offspring[1][0].elements[0].value
     assert (after - before) % 1 == pytest.approx(0.5)
@@ -237,6 +239,7 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
     ga = StandardGA(
         molecule, runner, evaluator=DistinctGeometryEvaluator(), coordinates=coordinates,
         pop_size=12, num_confs=6, generations=2, mutation_rate=1.0, seed=1,
+        prune_rms_thresh=0.1,
     )
     conformers = ga.run()
     assert len(conformers) == 12
@@ -263,8 +266,12 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
         assert 0 <= row["success_rate"] <= 1
         assert row["elite_survivors"] <= row["produced"]
     energies = runner.conformation_energies
-    assert energies.heading == ["conformation", "origin", "energy"]
-    assert energies.type == ["number", "string", "number"]
+    assert energies.heading == ["conformation", "origin", "energy", "history"]
+    assert energies.type == ["number", "string", "number", "string"]
+    assert energies.row
+    for row in energies.row:
+        assert row["history"].endswith("I,0")
+        assert row["history"].split(" < ")[1].split(",")[0] in {"I", "M", "X"}
     assert [row["energy"] for row in energies.row] == sorted(row["energy"] for row in energies.row)
     histogram = runner.energy_histogram
     assert histogram.series[0].type == "column"
@@ -301,6 +308,7 @@ def test_charts_refresh_on_every_iteration(molecule, coordinates, tmp_path, monk
     ga = StandardGA(
         molecule, runner, evaluator=WatchingEvaluator(), coordinates=coordinates,
         pop_size=4, num_confs=4, generations=2, mutation_rate=1.0, seed=1,
+        prune_rms_thresh=0.1,
     )
     ga.run()
     assert seen == [
@@ -353,7 +361,12 @@ def test_restart_restores_generator_random_state(molecule, coordinates, tmp_path
     ga = StandardGA(molecule, logging.getLogger("test"), evaluator=Evaluator(),
                     coordinates=coordinates, mutation_rate=1.0)
     ga.setup()
-    population = ga.population_generator.generate(4)
+    generated = ga.population_generator.generate(4)
+    population = []
+    for coords, origin, _energy in generated:
+        index = len(ga._history)
+        ga._history.append({"op": "I", "index": index})
+        population.append((coords, origin, 1.0, index))
     ga.save_state(population, 2)
     expected = ga.reproduce(population[:1], 4)
     restored, generation = ga.load_state()
@@ -416,20 +429,25 @@ def test_lower_energy_child_replaces_a_close_parent(molecule, coordinates):
     ga.population_generator._shift(far.elements[0], 90)
     child = copy.deepcopy(close)
 
-    def fake_reproduce(parents, target_size, prune_rms_thresh):
+    def fake_reproduce(parents, target_size, prune_rms_thresh, history):
         ga.population_generator.reproduction_stats = {
             "accepted": 1,
             "rejected_rmsd": 0,
             "rejected_noop": 0,
             "closest_rejected_rmsd": None,
         }
-        return list(parents) + [(child, "mutation-single", None)]
+        history.append({
+            "op": "M", "index": 2, "ancestor": 0, "dihedral": 0, "angle": 30.0,
+        })
+        return list(parents) + [(child, "mutation-single", None, 2)]
 
     ga.population_generator.reproduce = fake_reproduce
     ga.evaluate_population = lambda population: [(0.1, population[0])]
-    selected = ga.selection([(5.0, close, "initial"), (1.0, far, "initial")], 0)
+    selected = ga.selection(
+        [(5.0, close, "initial", 0), (1.0, far, "initial", 1)], 0,
+    )
     assert ga.pop_size == 2
-    assert [(origin, energy) for _, origin, energy in selected] == [
+    assert [(origin, energy) for _, origin, energy, _index in selected] == [
         ("mutation-single", 0.1),
         ("initial", 1.0),
     ]
@@ -484,8 +502,57 @@ def test_relaxation_into_one_well_does_not_drop_the_population(molecule, coordin
 
 def test_crossover_requires_two_parents(molecule, coordinates):
     generator = PopulationGenerator(molecule, coordinates=coordinates, mutation_rate=0)
+    coords, origin, energy = generator.generate(1)[0]
+    history = [{"op": "I", "index": 0}]
     with pytest.raises(ValueError, match="two parents"):
-        generator.reproduce(generator.generate(1), 2, 0.1)
+        generator.reproduce([(coords, origin, energy, 0)], 2, 0.1, history)
+
+
+def test_history_walks_mutation_and_crossover_back_to_the_input(molecule, coordinates):
+    generator = PopulationGenerator(
+        molecule, coordinates=coordinates, mutation_rate=1.0,
+        dihedral_interval=30.0, seed=1,
+    )
+    history = [{"op": "I", "index": 0}]
+    coords, origin, energy = generator.generate(1)[0]
+    mutated = generator.reproduce([(coords, origin, energy, 0)], 2, 0.1, history)
+    mutation = history[mutated[1][3]]
+    assert mutation["op"] == "M"
+    assert mutation["ancestor"] == 0
+    assert mutation["dihedral"] == 0
+    assert mutation["angle"] != 0
+
+    crosser = PopulationGenerator(
+        molecule, coordinates=coordinates, mutation_rate=0.0, seed=1,
+    )
+    second = copy.deepcopy(coords)
+    crosser._shift(second.elements[0], 40.0)
+    parents = [
+        (coords, "initial", 1.0, 0),
+        (second, "mutation-single", 2.0, mutation["index"]),
+    ]
+    crossed = crosser.reproduce(parents, 3, 0.1, history)
+    child_index = crossed[2][3]
+    cross = history[child_index]
+    assert cross["op"] == "X"
+    assert {cross["a1"], cross["a2"]} == {0, mutation["index"]}
+    assert cross["cut"] == 0
+
+    ga = StandardGA(molecule, logging.getLogger("test"), coordinates=coordinates, pop_size=1)
+    ga.setup()
+    ga._history = history
+    ga._remember_conformation_energies([(crossed[2][0], "crossover", 2.0, child_index)])
+    trace = ga._conformation_rows[0]["history"]
+    assert trace.startswith(f"{child_index} < X,{cross['a1']},{cross['a2']},{cross['cut']}")
+    assert f"M,{mutation['ancestor']},{mutation['dihedral']},{mutation['angle']:+.6f}" in trace
+    assert "I,0" in trace
+
+
+def test_reproduction_rejects_a_parent_missing_from_history(molecule, coordinates):
+    generator = PopulationGenerator(molecule, coordinates=coordinates, mutation_rate=1)
+    coords, origin, energy = generator.generate(1)[0]
+    with pytest.raises(ValueError, match="not in the GA history"):
+        generator.reproduce([(coords, origin, energy, 4)], 2, 0.1, [{"op": "I", "index": 0}])
 
 
 def test_non_positive_prune_threshold_is_rejected(molecule, coordinates):
@@ -569,8 +636,10 @@ def test_overlapping_conformer_is_excluded_and_not_scored(molecule, coordinates,
     good = copy.deepcopy(ga.template_coords)
     bad = copy.deepcopy(ga.template_coords)
     ga.molecule_from_coordinates = collide
-    kept = ga._exclude_overlaps([(good, "initial", None), (bad, "mutation-single", None)])
-    assert kept == [(good, "initial", None)]
+    kept = ga._exclude_overlaps([
+        (good, "initial", None, 0), (bad, "mutation-single", None, 1),
+    ])
+    assert kept == [(good, "initial", None, 0)]
     assert evaluator.calls == []
     assert "positive infinity" in runner.log_string
 
@@ -599,6 +668,174 @@ def test_hydrogens_0_982_angstrom_apart_overlap_and_a_normal_contact_does_not():
     separated = Molecule.from_molecule(seed)
     separated.atoms[3].x = separated.atoms[1].x + 1.72
     assert ga._overlapping_atoms(separated) is None
+
+
+def test_high_force_field_gradient_is_repeated_twice_then_discarded(molecule, monkeypatch):
+    calls = {"minimize": 0}
+
+    class FakeField:
+        def Initialize(self):
+            return None
+
+        def Minimize(self, maxIts, forceTol, energyTol):
+            calls["minimize"] += 1
+            assert forceTol == 1e-4
+            return 0
+
+        def CalcEnergy(self):
+            return 50.0
+
+        def CalcGrad(self):
+            return (100.0, 0.0, 0.0) * len(molecule.atoms)
+
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFHasAllMoleculeParams", lambda rdkit_mol: True)
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFGetMoleculeForceField", lambda rdkit_mol: FakeField())
+    evaluator = RDKitEvaluator(forcefield="uff")
+    evaluator.bind_connectivity(molecule)
+    result = evaluator.optimize([molecule], max_iters=20)
+    assert calls["minimize"] == 3
+    assert result[0].properties["force_field_discarded"] is True
+    assert result[0].properties["optimization_converged"] is False
+    assert result[0].properties["force_field_gradient"] > 1e-4
+
+
+def test_low_force_field_gradient_stops_without_a_repeat(molecule, monkeypatch):
+    calls = {"minimize": 0}
+
+    class FakeField:
+        def Initialize(self):
+            return None
+
+        def Minimize(self, maxIts, forceTol, energyTol):
+            calls["minimize"] += 1
+            return 0
+
+        def CalcEnergy(self):
+            return 50.0
+
+        def CalcGrad(self):
+            return (0.0,) * (len(molecule.atoms) * 3)
+
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFHasAllMoleculeParams", lambda rdkit_mol: True)
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFGetMoleculeForceField", lambda rdkit_mol: FakeField())
+    evaluator = RDKitEvaluator(forcefield="uff")
+    evaluator.bind_connectivity(molecule)
+    result = evaluator.optimize([molecule], max_iters=20)
+    assert calls["minimize"] == 1
+    assert result[0].properties.get("force_field_discarded") is not True
+    assert result[0].properties["optimization_converged"] is True
+
+
+def test_nh2_hydrogen_swap_has_no_dihedral_rmsd():
+    from molecular_qm_search.optimization.ga_population import dihedral_rmsd
+
+    amine = Molecule(atoms=[
+        Atom(element="C", x=0.0, y=1.2, z=0.0),
+        Atom(element="C", x=0.0, y=0.0, z=0.0),
+        Atom(element="N", x=1.40, y=0.0, z=0.0),
+        Atom(element="H", x=1.85, y=0.90, z=0.0),
+        Atom(element="H", x=1.85, y=-0.90, z=0.0),
+    ])
+    torsion = InternalDihedralCoordinate.initialize(0, 1, 2, 3, -180, 180)
+    torsion.compute(amine)
+    ga = StandardGA(
+        amine, logging.getLogger("test"), coordinates=InternalCoordinatesList(elements=[torsion]),
+        pop_size=2, generations=0,
+    )
+    ga.setup()
+    shift = ga._dihedral_symmetries[0]
+    assert shift is not None
+    assert abs(abs(shift) - 180) < 5
+    swapped = copy.deepcopy(ga.template_coords)
+    angle = float(swapped.elements[0].get_actual_value(swapped.elements[0].value)) + shift
+    low, high = swapped.elements[0].min_values[0], swapped.elements[0].max_values[0]
+    swapped.elements[0].value = (angle - low) / (high - low)
+    swapped.elements[0].real_values = [angle]
+    assert ga.dihedral_rmsd(ga.template_coords, swapped) == pytest.approx(0.0, abs=1e-6)
+    assert ga.dihedral_rmsd(swapped, ga.template_coords) == pytest.approx(0.0, abs=1e-6)
+    assert dihedral_rmsd(ga.template_coords, swapped) == pytest.approx(abs(shift), abs=0.1)
+    kept, prune = ga._unique_conformers([
+        (1.0, ga.template_coords, "initial", 0),
+        (2.0, swapped, "mutation-single", 1),
+    ])
+    assert len(kept) == 1
+    assert prune["dropped"] == 1
+
+
+def test_minimizing_ga_drops_an_optimized_conformer_with_clashing_hydrogens():
+    amine = Molecule(atoms=[
+        Atom(element="C", x=0.0, y=0.0, z=0.0),
+        Atom(element="N", x=1.45, y=0.0, z=0.0),
+        Atom(element="H", x=1.85, y=0.90, z=0.2),
+        Atom(element="H", x=1.85, y=-0.90, z=0.2),
+    ])
+
+    class CrushHydrogens:
+        def score(self, molecules):
+            return self.optimize(molecules, max_iters=1)
+
+        def optimize(self, molecules, *, max_iters):
+            results = []
+            for source in molecules:
+                result = Molecule.from_molecule(source)
+                result.atoms[3].x = result.atoms[2].x
+                result.atoms[3].y = result.atoms[2].y
+                result.atoms[3].z = result.atoms[2].z + 0.58
+                result.properties["energy"] = 136.0
+                result.properties["energy_unit"] = "kcal/mol"
+                results.append(result)
+            return results
+
+    runner = RecordingRunner()
+    ga = MinimizingGA(
+        amine, runner, evaluator=CrushHydrogens(), coordinates=InternalCoordinatesList(),
+        pop_size=1, generations=0,
+    )
+    ga.setup()
+    assert ga._overlapping_atoms(amine) is None
+    scored = ga.evaluate_population([InternalCoordinatesList()])
+    assert scored == [None]
+    assert "H3 and H4" in runner.log_string
+    assert "0.580" in runner.log_string
+
+
+def test_minimizing_ga_drops_a_conformer_whose_gradient_stays_high(molecule, coordinates):
+    class DiscardEvaluator:
+        def score(self, molecules):
+            results = []
+            for source in molecules:
+                result = Molecule.from_molecule(source)
+                result.properties["energy"] = 1.0
+                result.properties["energy_unit"] = "kcal/mol"
+                results.append(result)
+            return results
+
+        def optimize(self, molecules, *, max_iters):
+            results = []
+            for index, source in enumerate(molecules):
+                result = Molecule.from_molecule(source)
+                result.properties["energy"] = 1.0 + index
+                result.properties["energy_unit"] = "kcal/mol"
+                if index == 0:
+                    result.properties["force_field_discarded"] = True
+                    result.properties["force_field_gradient"] = 12.5
+                results.append(result)
+            return results
+
+    runner = RecordingRunner()
+    ga = MinimizingGA(
+        molecule, runner, evaluator=DiscardEvaluator(), coordinates=coordinates,
+        pop_size=2, generations=0,
+    )
+    ga.setup()
+    scored = ga.evaluate_population([
+        copy.deepcopy(ga.template_coords),
+        copy.deepcopy(ga.template_coords),
+    ])
+    assert scored[0] is None
+    assert scored[1][0] == 2.0
+    assert "gradient stayed high (12.5)" in runner.log_string
+    assert "two repeated optimizations" in runner.log_string
 
 
 @pytest.mark.parametrize("ga_class", [StandardGA, MinimizingGA, DiversityGA])

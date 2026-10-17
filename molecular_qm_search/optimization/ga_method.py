@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import copy
 import numpy as np
 import time
 import pickle
@@ -63,7 +64,7 @@ class BaseGA:
             generations: int = 50,
             mutation_rate: float = 0.2,
             dihedral_interval: float = 30.0,
-            prune_rms_thresh: float = 0.1,
+            prune_rms_thresh: float = 20.0,
             seed: int = 1,
             max_iters: int = 500,
             parallel_children: int = 0,
@@ -130,6 +131,8 @@ class BaseGA:
                 f"rotatable_bond_min ({rotatable_bond_min})"
             )
         self._bonded_pairs = None
+        self._dihedral_symmetries = None
+        self._history: List[dict] = []
         self._conformation_rows: List[Dict[str, Union[int, float, str]]] = []
         self.evaluator = evaluator if evaluator is not None else make_evaluator(
             optimization_method, parallel_children=parallel_children,
@@ -166,12 +169,13 @@ class BaseGA:
             "success_stats": self.success_stats,
             "energy_history": self.energy_history,
             "best_energy_seen": self.best_energy_seen,
-            "random_state": self.population_generator.random.getstate()
+            "random_state": self.population_generator.random.getstate(),
+            "history": self._history,
         }
         if hasattr(self, "rmsd_history"):
             state["rmsd_history"] = self.rmsd_history
         if hasattr(self, "relaxed"):
-            state["relaxed"] = [self.relaxed.get(id(coords)) for coords, _, _ in population]
+            state["relaxed"] = [self.relaxed.get(id(coords)) for coords, _, _, _ in population]
 
         with open("ga_state.pkl", "wb") as f:
             pickle.dump(state, f)
@@ -193,8 +197,17 @@ class BaseGA:
         if "success_stats" not in state:
             raise ValueError("GA checkpoint has no success_stats")
         population = state.get("population")
-        if not population or any(not isinstance(item, tuple) or len(item) != 3 for item in population):
+        if not population or any(
+            not isinstance(item, tuple) or len(item) != 4 or item[2] is None for item in population
+        ):
             raise ValueError("GA checkpoint population has no energies")
+        if "history" not in state or not isinstance(state["history"], list):
+            raise ValueError("GA checkpoint has no history")
+        self._history = state["history"]
+        for item in population:
+            history_index = item[3]
+            if not isinstance(history_index, int) or not 0 <= history_index < len(self._history):
+                raise ValueError(f"Configuration {history_index} is not in the GA history")
         self.best_stored = state.get("best_stored", MoleculeList())
         self.success_stats = state["success_stats"]
         self.energy_history = state["energy_history"]
@@ -206,7 +219,7 @@ class BaseGA:
             if relaxed is None or len(relaxed) != len(population):
                 raise ValueError("GA checkpoint is missing relaxed geometries")
             self.relaxed = {}
-            for (coords, _, _), molecule in zip(population, relaxed):
+            for (coords, _, _, _), molecule in zip(population, relaxed):
                 if molecule is not None:
                     self.relaxed[id(coords)] = molecule
         self._report(f"Loaded GA state from generation {state['gen']}.")
@@ -232,6 +245,39 @@ class BaseGA:
             for c in self.template_coords.elements
         ]
         self._bonded_pairs = self._bonds_of(self.initial_mol)
+        self._dihedral_symmetries = []
+        for coord in self.template_coords.elements:
+            atom1, atom2, atom3, atom4 = (int(index) for index in coord.atom_indices)
+            neighbors = [
+                other for other in range(len(self.initial_mol.atoms))
+                if other != atom3 and (min(atom3, other), max(atom3, other)) in self._bonded_pairs
+            ]
+            other_hydrogens = [
+                other for other in neighbors
+                if other != atom4 and self.initial_mol.atoms[other].element == "H"
+            ]
+            terminal_pair = (
+                self.initial_mol.atoms[atom4].element == "H"
+                and len(other_hydrogens) == 1
+                and set(neighbors) == {atom2, atom4, other_hydrogens[0]}
+            )
+            if not terminal_pair:
+                self._dihedral_symmetries.append(None)
+                continue
+            if not coord.real_values or not np.isfinite(float(coord.real_values[0])):
+                raise ValueError(
+                    f"Dihedral {tuple(coord.atom_indices)} has no angle on the input geometry"
+                )
+            primary = float(coord.real_values[0])
+            alternate = copy.deepcopy(coord)
+            alternate.atom_indices = [atom1, atom2, atom3, other_hydrogens[0]]
+            alternate.compute(self.initial_mol)
+            shift = (float(alternate.real_values[0]) - primary + 180.0) % 360.0 - 180.0
+            if not np.isfinite(shift) or abs(shift) < 1.0:
+                raise ValueError(
+                    f"Dihedral {tuple(coord.atom_indices)} hydrogens do not define a symmetry shift"
+                )
+            self._dihedral_symmetries.append(shift)
         bind_connectivity = getattr(self.evaluator, "bind_connectivity", None)
         if bind_connectivity is not None:
             bind_connectivity(self.initial_mol)
@@ -288,13 +334,18 @@ class BaseGA:
 
     def _exclude_overlaps(self, population):
         kept = []
-        for coords, origin, energy in population:
+        for item in population:
+            if not isinstance(item, tuple) or len(item) != 4:
+                raise ValueError(
+                    "Population conformers must carry coordinates, origin, energy, and history index"
+                )
+            coords, origin, energy, _history_index = item
             if energy is not None:
-                kept.append((coords, origin, energy))
+                kept.append(item)
                 continue
             overlap = self._overlapping_atoms(self.molecule_from_coordinates(coords))
             if overlap is None:
-                kept.append((coords, origin, energy))
+                kept.append(item)
                 continue
             self._report(
                 f"Excluded {origin} conformer because {overlap}. "
@@ -304,14 +355,56 @@ class BaseGA:
 
     def _remember_conformation_energies(self, population) -> None:
         ordered = sorted(population, key=lambda item: (float(item[2]), item[1]))
-        self._conformation_rows = [
-            {
+        rows = []
+        for index, item in enumerate(ordered):
+            if not isinstance(item, tuple) or len(item) != 4:
+                raise ValueError(
+                    "Population conformers must carry coordinates, origin, energy, and history index"
+                )
+            _coords, origin, energy, history_index = item
+            if not isinstance(history_index, int) or not 0 <= history_index < len(self._history):
+                raise ValueError(f"Configuration {history_index} is not in the GA history")
+            parts = [str(history_index)]
+            pending = [history_index]
+            visited = set()
+            while pending:
+                current = pending.pop()
+                if current in visited:
+                    continue
+                if not isinstance(current, int) or not 0 <= current < len(self._history):
+                    raise ValueError(f"Configuration {current} is not in the GA history")
+                record = self._history[current]
+                if not isinstance(record, dict) or "op" not in record:
+                    raise ValueError(f"Configuration {current} has no history operation")
+                visited.add(current)
+                operation = record["op"]
+                if operation == "I":
+                    parts.append(f"I,{current}")
+                elif operation == "M":
+                    if "ancestor" not in record or "dihedral" not in record or "angle" not in record:
+                        raise ValueError(
+                            f"Mutation {current} is missing ancestor, dihedral, or angle"
+                        )
+                    ancestor = record["ancestor"]
+                    parts.append(
+                        f"M,{ancestor},{record['dihedral']},{float(record['angle']):+.6f}"
+                    )
+                    pending.append(ancestor)
+                elif operation == "X":
+                    if "a1" not in record or "a2" not in record or "cut" not in record:
+                        raise ValueError(f"Crossover {current} is missing ancestors or cut")
+                    parts.append(f"X,{record['a1']},{record['a2']},{record['cut']}")
+                    pending.append(record["a2"])
+                    pending.append(record["a1"])
+                else:
+                    raise ValueError(f"Unknown GA history operation {operation!r}")
+            rows.append({
                 "conformation": index + 1,
                 "energy": float(energy),
                 "origin": origin,
-            }
-            for index, (_, origin, energy) in enumerate(ordered)
-        ]
+                "history": " < ".join(parts),
+            })
+        self._conformation_rows = rows
 
     def _attach_conformation_table(self, chart) -> None:
         if not self._conformation_rows:
@@ -328,17 +421,31 @@ class BaseGA:
 
     def reproduce(self, best_individuals, target_size):
         return self.population_generator.reproduce(
-            best_individuals, target_size, self.prune_rms_thresh,
+            best_individuals, target_size, self.prune_rms_thresh, self._history,
         )
 
     def dihedral_rmsd(self, ind1: InternalCoordinatesList, ind2: InternalCoordinatesList) -> float:
-        return dihedral_rmsd(ind1, ind2)
+        if self._dihedral_symmetries is None:
+            raise ValueError("Dihedral symmetries are unavailable before setup")
+        return dihedral_rmsd(ind1, ind2, self._dihedral_symmetries)
 
     def _report(self, message: str) -> None:
         """Send a message to the task log and the node runner info log."""
         if hasattr(self.node_runner, "log_string"):
             self.node_runner.log(message)
         self.node_runner.info(message)
+
+    def _force_field_discarded(self, molecule) -> bool:
+        if molecule.properties.get("force_field_discarded") is not True:
+            return False
+        gradient = molecule.properties.get("force_field_gradient")
+        if gradient is None or not np.isfinite(float(gradient)):
+            raise ValueError("Discarded conformer has no force-field gradient")
+        self._report(
+            "Discarded conformer because the force-field gradient stayed high "
+            f"({float(gradient):.6g}) after two repeated optimizations."
+        )
+        return True
 
     def _count_origin(self, origin: str, *, elite: bool) -> None:
         counts = self.success_stats.setdefault(origin, [0, 0])
@@ -418,16 +525,16 @@ class BaseGA:
         """Keep the lowest-energy conformer of each dihedral neighborhood."""
         kept = []
         nearest_dropped = None
-        for energy, coords, origin in scored_pop:
+        for energy, coords, origin, history_index in scored_pop:
             if kept:
                 distance = min(
-                    self.dihedral_rmsd(coords, previous) for _, previous, _ in kept
+                    self.dihedral_rmsd(coords, previous) for _, previous, _, _ in kept
                 )
                 if distance < self.prune_rms_thresh:
                     if nearest_dropped is None or distance < nearest_dropped:
                         nearest_dropped = distance
                     continue
-            kept.append((energy, coords, origin))
+            kept.append((energy, coords, origin, history_index))
         if not kept:
             raise ValueError("Uniqueness filter removed every conformer")
         dropped = len(scored_pop) - len(kept)
@@ -448,36 +555,42 @@ class BaseGA:
         if not scored_parents:
             raise ValueError("Cannot select from an empty population")
         parents = []
-        for energy, coords, origin in scored_parents:
+        for energy, coords, origin, history_index in scored_parents:
             if energy is None or not np.isfinite(energy):
                 raise ValueError("Parent conformer has no finite energy")
-            parents.append((coords, origin, float(energy)))
+            parents.append((coords, origin, float(energy), history_index))
         proposed = self.reproduce(parents, len(parents) + self.pop_size)
         children = self._exclude_overlaps(proposed[len(parents):])
         child_scored = []
         if children:
-            scored = self.evaluate_population([coords for coords, _, _ in children])
+            scored = self.evaluate_population([coords for coords, _, _, _ in children])
             if len(scored) != len(children):
                 raise ValueError(
                     f"Evaluator returned {len(scored)} energies for {len(children)} children"
                 )
-            for (energy, coords), (_, origin, _) in zip(scored, children):
+            for outcome, (_, origin, _, history_index) in zip(scored, children):
+                if outcome is None:
+                    continue
+                energy, coords = outcome
                 if energy is None or not np.isfinite(energy):
                     raise ValueError("Child conformer has no finite energy")
-                child_scored.append((float(energy), coords, origin))
+                child_scored.append((float(energy), coords, origin, history_index))
         stats = self.population_generator.reproduction_stats
         if not isinstance(stats, dict):
             raise ValueError("Breeding finished without reproduction statistics")
         for key in ("accepted", "rejected_noop"):
             if key not in stats:
                 raise ValueError(f"Reproduction statistics are missing {key}")
-        combined = [(energy, coords, origin) for coords, origin, energy in parents] + child_scored
+        combined = [
+            (energy, coords, origin, history_index)
+            for coords, origin, energy, history_index in parents
+        ] + child_scored
         combined.sort(key=lambda item: item[0])
         unique, prune = self._unique_conformers(combined)
         kept = unique[:self.pop_size]
         nearest_pair = None
-        for index, (_, coords, _) in enumerate(kept):
-            for _, other, _ in kept[index + 1:]:
+        for index, (_, coords, _, _) in enumerate(kept):
+            for _, other, _, _ in kept[index + 1:]:
                 distance = self.dihedral_rmsd(coords, other)
                 if nearest_pair is None or distance < nearest_pair:
                     nearest_pair = distance
@@ -503,7 +616,10 @@ class BaseGA:
             f"(current population {len(kept)}, maximum pop_size {self.pop_size}); "
             f"{separation}."
         )
-        return [(coords, origin, energy) for energy, coords, origin in kept]
+        return [
+            (coords, origin, energy, history_index)
+            for energy, coords, origin, history_index in kept
+        ]
 
     def _publish_energy_chart(self) -> None:
         if not self.energy_history:
@@ -850,11 +966,15 @@ class BaseGA:
         energies.add_column("conformation", SimpleTableColumnType.NUMBER)
         energies.add_column("origin", SimpleTableColumnType.STRING)
         energies.add_column("energy", SimpleTableColumnType.NUMBER)
+        energies.add_column("history", SimpleTableColumnType.STRING)
         for row in self._conformation_rows:
+            if "history" not in row:
+                raise ValueError(f"Conformation {row.get('conformation')} has no history")
             energies.add_row({
                 "conformation": row["conformation"],
                 "origin": row["origin"],
                 "energy": row["energy"],
+                "history": row["history"],
             })
         self.node_runner.conformation_energies = energies
         self._persist_live_artifacts()
@@ -896,7 +1016,10 @@ class BaseGA:
             "relax those geometries. num_confs caps the returned list of ga-min and "
             "ga-select. ga-min compares optimized geometries, so starts that relax into "
             "one well collapse there. ga-select also drops conformers above "
-            "min energy + 0.1*|min energy| before breeding."
+            "min energy + 0.1*|min energy| before breeding. "
+            "When a force-field minimization stops with a gradient above its force "
+            "tolerance, it is repeated twice, and the conformer is discarded if the "
+            "gradient is still high."
         )
         self._report(f"Rotatable Bonds: {len(self.template_coords.elements)}")
         self._report(f"Dihedrals:       {self.dihedrals}")
@@ -908,14 +1031,29 @@ class BaseGA:
             evaluated = self.evaluate_molecules(
                 [self.initial_mol], optimize=type(self) is not StandardGA,
             )
+            evaluated = [
+                molecule for molecule in evaluated if not self._force_field_discarded(molecule)
+            ]
+            if not evaluated:
+                raise ValueError(
+                    "Force-field optimization discarded the conformer because its gradient "
+                    "stayed high after two repeated optimizations"
+                )
             ordered = sorted(evaluated, key=lambda molecule: float(molecule.properties["energy"]))
+            if len(ordered) != 1:
+                raise ValueError(
+                    f"A molecule with no rotatable bonds produced {len(ordered)} conformers"
+                )
+            if self._history:
+                raise ValueError("GA history was already started")
+            self._history.append({"op": "I", "index": 0})
             self._conformation_rows = [
                 {
-                    "conformation": index + 1,
-                    "energy": float(molecule.properties["energy"]),
+                    "conformation": 1,
+                    "energy": float(ordered[0].properties["energy"]),
                     "origin": "initial",
+                    "history": "0 < I,0",
                 }
-                for index, molecule in enumerate(ordered)
             ]
             self._record_energy_iteration(0, [mol.properties["energy"] for mol in evaluated])
             molecules = self._ranked_population(evaluated, limit=self.num_confs)
@@ -931,7 +1069,14 @@ class BaseGA:
                 start_gen += 1  # Start from the next generation
 
         if population is None:
-            population = self.population_generator.generate(1)
+            generated = self.population_generator.generate(1)
+            if len(generated) != 1:
+                raise ValueError(f"Seed generation returned {len(generated)} conformers")
+            coords, origin, energy = generated[0]
+            if self._history:
+                raise ValueError("GA history was already started")
+            self._history.append({"op": "I", "index": 0})
+            population = [(coords, origin, energy, 0)]
             self._report(
                 "Seed population: the input geometry alone. "
                 "Later conformers come from mutation and crossover."
@@ -942,25 +1087,45 @@ class BaseGA:
             population = self._exclude_overlaps(population)
             if not population:
                 raise ValueError(f"Generation {gen} has no conformers after excluding overlaps")
-            pending = [index for index, (_, _, energy) in enumerate(population) if energy is None]
+            pending = [index for index, (_, _, energy, _) in enumerate(population) if energy is None]
             if pending:
                 scored_pop = self.evaluate_population([population[index][0] for index in pending])
                 if len(scored_pop) != len(pending):
                     raise ValueError(
                         f"Evaluator returned {len(scored_pop)} energies for {len(pending)} individuals"
                     )
-                for index, (energy, coords) in zip(pending, scored_pop):
+                discarded = []
+                for index, outcome in zip(pending, scored_pop):
+                    if outcome is None:
+                        discarded.append(index)
+                        continue
+                    energy, coords = outcome
                     if energy is None or not np.isfinite(energy):
                         raise ValueError("Population conformer has no finite energy")
-                    population[index] = (coords, population[index][1], float(energy))
-            for _, _, energy in population:
+                    population[index] = (
+                        coords, population[index][1], float(energy), population[index][3],
+                    )
+                if discarded:
+                    discarded_indexes = set(discarded)
+                    population = [
+                        item for index, item in enumerate(population) if index not in discarded_indexes
+                    ]
+                if not population:
+                    raise ValueError(
+                        "Generation "
+                    f"{gen} has no conformers after discarding overlaps or high force-field gradients"
+                    )
+            for _, _, energy, _ in population:
                 if energy is None or not np.isfinite(energy):
                     raise ValueError("Population conformer has no finite energy")
-            scored_with_labels = [(energy, coords, origin) for coords, origin, energy in population]
+            scored_with_labels = [
+                (energy, coords, origin, history_index)
+                for coords, origin, energy, history_index in population
+            ]
             population = self.selection(scored_with_labels, gen)
             energies = []
             scored_coords = []
-            for coords, _, energy in population:
+            for coords, _, energy, _ in population:
                 if energy is None or not np.isfinite(energy):
                     raise ValueError("Population conformer has no finite energy")
                 energies.append(energy)
@@ -972,7 +1137,7 @@ class BaseGA:
             self._publish_diversity_chart(scored_coords)
             self._publish_dihedral_histograms(scored_coords)
             self._persist_live_artifacts()
-            self.post_generation_hook([coords for coords, _, _ in population], gen)
+            self.post_generation_hook([coords for coords, _, _, _ in population], gen)
 
             # Save state at the end of each generation (or every n generations)
             if gen != 0 and gen % 5 == 0 or gen == self.generations:
@@ -997,7 +1162,7 @@ class BaseGA:
         scored_pop.sort(key=lambda x: x[0])
         elite_size = max(1, int(self.pop_size * 0.2))
         elite_count = min(len(scored_pop), elite_size)
-        for index, (_, _, origin) in enumerate(scored_pop):
+        for index, (_, _, origin, _) in enumerate(scored_pop):
             self._count_origin(origin, elite=index < elite_count)
 
         return self._select_next_population(scored_pop, gen)
@@ -1007,7 +1172,7 @@ class BaseGA:
 
     def finalize(self, population) -> MoleculeList:
         t2 = time.perf_counter()
-        self.evaluate_population([coords for coords, _, _ in population])
+        self.evaluate_population([coords for coords, _, _, _ in population])
         final_ranked = self._ranked_population(self.evaluated_molecules, limit=self.num_confs)
 
         self.timing["Finalization"] = time.perf_counter() - t2
@@ -1029,7 +1194,7 @@ class StandardGA(BaseGA):
     def finalize(self, population) -> MoleculeList:
         ordered = sorted(population, key=lambda item: (float(item[2]), item[1]))
         molecules = []
-        for coords, _, energy in ordered:
+        for coords, _, energy, _history_index in ordered:
             if energy is None or not np.isfinite(float(energy)):
                 raise ValueError("Population molecule has no finite energy")
             molecule = self.molecule_from_coordinates(coords)
@@ -1059,6 +1224,8 @@ class MinimizingGA(BaseGA):
                                               max_iters=max(1, self.max_iters // 10))
             keep = []
             for index, (start, current) in enumerate(zip(starting, partial)):
+                if current.properties.get("force_field_discarded") is True:
+                    continue
                 self.smart_optimizer.stats["total"] += 1
                 delta = start.properties["energy"] - current.properties["energy"]
                 if not self.smart_optimizer.should_discard(
@@ -1075,29 +1242,62 @@ class MinimizingGA(BaseGA):
                 optimized[index] = result
         else:
             optimized = self.evaluate_molecules(molecules, optimize=True)
-        self.evaluated_molecules = optimized
-        if optimized:
-            self.best_energy_seen = min(self.best_energy_seen,
-                                       min(m.properties["energy"] for m in optimized))
+        self.evaluated_molecules = [
+            molecule for molecule in optimized if not self._force_field_discarded(molecule)
+        ]
+        if self.evaluated_molecules:
+            self.best_energy_seen = min(
+                self.best_energy_seen,
+                min(float(molecule.properties["energy"]) for molecule in self.evaluated_molecules),
+            )
         paired = []
+        kept = {id(molecule) for molecule in self.evaluated_molecules}
         for molecule in optimized:
+            if id(molecule) not in kept:
+                paired.append(None)
+                continue
+            overlap = self._overlapping_atoms(molecule)
+            if overlap is not None:
+                self._report(
+                    f"Excluded optimized conformer because {overlap}. "
+                    "Overlapping atoms score positive infinity and leave the population."
+                )
+                paired.append(None)
+                continue
             coords = self.coordinates_from_molecule(molecule)
             self.relaxed[id(coords)] = molecule
             paired.append((float(molecule.properties["energy"]), coords))
         return paired
 
     def finalize(self, population) -> MoleculeList:
-        pending = [index for index, (_, _, energy) in enumerate(population) if energy is None]
+        pending = [index for index, (_, _, energy, _) in enumerate(population) if energy is None]
         if pending:
             scored = self.evaluate_population([population[index][0] for index in pending])
             if len(scored) != len(pending):
                 raise ValueError(
                     f"Evaluator returned {len(scored)} energies for {len(pending)} individuals"
                 )
-            for index, (energy, coords) in zip(pending, scored):
-                population[index] = (coords, population[index][1], float(energy))
+            discarded = []
+            for index, outcome in zip(pending, scored):
+                if outcome is None:
+                    discarded.append(index)
+                    continue
+                energy, coords = outcome
+                population[index] = (
+                    coords, population[index][1], float(energy), population[index][3],
+                )
+            if discarded:
+                discarded_indexes = set(discarded)
+                population = [
+                    item for index, item in enumerate(population) if index not in discarded_indexes
+                ]
+            if not population:
+                raise ValueError(
+                    "Final population has no conformers after discarding overlaps "
+                    "or high force-field gradients"
+                )
         molecules = []
-        for coords, _, _ in population:
+        for coords, _, _, _ in population:
             molecule = self.relaxed.get(id(coords))
             if molecule is None:
                 raise ValueError("Minimizing GA is missing the relaxed geometry for a carried conformer")
@@ -1123,7 +1323,7 @@ class DiversityGA(BaseGA):
 
         scored_pop.sort(key=lambda x: x[0])
         elite_size = min(len(scored_pop), max(1, int(self.pop_size * 0.2)))
-        for index, (_, _, origin) in enumerate(scored_pop):
+        for index, (_, _, origin, _) in enumerate(scored_pop):
             self._count_origin(origin, elite=index < elite_size)
 
         min_energy = scored_pop[0][0]
@@ -1138,8 +1338,8 @@ class DiversityGA(BaseGA):
         )
         new_population = self._select_next_population(accepted, gen)
 
-        before_scores = self.get_pairwise_rmsd_scores([coords for _, coords, _ in accepted])
-        after_scores = self.get_pairwise_rmsd_scores([coords for coords, _, _ in new_population])
+        before_scores = self.get_pairwise_rmsd_scores([coords for _, coords, _, _ in accepted])
+        after_scores = self.get_pairwise_rmsd_scores([coords for coords, _, _, _ in new_population])
         self.rmsd_history.append({
             "gen": gen,
             "high_before": float(np.max(before_scores)) if len(before_scores) > 0 else 0.0,
@@ -1272,7 +1472,7 @@ class DiversityGA(BaseGA):
     def finalize(self, population) -> MoleculeList:
         if not self.best_stored or self.generations % self.n_prune != 0:
             self.post_generation_hook(
-                [coords for coords, _, _ in population], self.generations, force_prune=True,
+                [coords for coords, _, _, _ in population], self.generations, force_prune=True,
             )
 
         output_prefix = f"{self.__class__.__name__.lower()}"

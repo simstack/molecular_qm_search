@@ -150,13 +150,14 @@ def mutated_dihedral_molecules(molecule: Molecule) -> list[Molecule]:
     if len(selected) != 2:
         raise ValueError(f"Expected two selected mutants, built {len(selected)}")
 
-    parents = [(copy.deepcopy(template), "initial", None)]
-    offspring = generator.reproduce(parents, 4, 0.1)
+    history = [{"op": "I", "index": 0}]
+    parents = [(copy.deepcopy(template), "initial", None, 0)]
+    offspring = generator.reproduce(parents, 4, 0.1, history)
     if len(offspring) != 4 or offspring[0][1] != "initial":
         raise ValueError(
-            f"reproduce did not keep the parent: {[origin for _, origin, _ in offspring]}"
+            f"reproduce did not keep the parent: {[origin for _, origin, _, _ in offspring]}"
         )
-    for individual, origin, _ in offspring[1:]:
+    for individual, origin, _, _ in offspring[1:]:
         if not origin.startswith("mutation-"):
             raise ValueError(f"Expected a mutation origin, got {origin!r}")
         changed = []
