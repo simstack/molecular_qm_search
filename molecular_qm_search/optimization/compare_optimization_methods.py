@@ -1,12 +1,14 @@
 import inspect
 import logging
+from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 from odmantic import Field, Model
 from pydantic import model_validator
 
+from molecular_qm_dftb.models.dftb_input import DftbInput
 from molecular_qm_models import Molecule, MoleculeList
-from molecular_qm_psi4.models.crest_input import CrestInput
+from molecular_qm_psi4.models.crest_input import CrestInput, CrestLevelOfTheory
 from molecular_qm_search.optimization.models.ga_models import GAConformerParameters
 from simstack.core.node import node
 from simstack.models import simstack_model
@@ -15,6 +17,55 @@ from simstack.util.cleaned_json_schema import cleaned_json_schema
 from simstack.util.generate_ui_schema import generate_ui_schema
 
 logger = logging.getLogger(__name__)
+
+
+class ConformerRelaxationMethod(str, Enum):
+    """List calculator used to relax the generated conformers."""
+
+    XTB = "xtb"
+    DFTB = "dftb"
+
+
+@simstack_model
+class XTBListCalculatorParameters(Model):
+    """xTB list-calculator settings, without the molecule list.
+
+    ``compare_optimization_methods`` supplies the generated conformers.
+    Field names match ``XTBInput`` aside from ``molecules``.
+    """
+
+    field_name: str = "XTBListCalculatorParameters"
+    level_of_theory: CrestLevelOfTheory = Field(default_factory=CrestLevelOfTheory)
+    compute_gradients: bool = Field(False, description="Whether to compute gradients")
+    optimize: bool = Field(True, description="Whether to perform geometry optimization")
+    additional_keywords: Optional[str] = Field(
+        None, description="Any additional CREST command line arguments"
+    )
+
+    @classmethod
+    def json_schema(cls, recursive=True):
+        schema = cleaned_json_schema(cls)
+        schema["title"] = "xTB list calculator"
+        keywords = schema["properties"].get("additional_keywords")
+        if isinstance(keywords, dict) and "anyOf" in keywords:
+            for option in keywords["anyOf"]:
+                if option.get("type") == "string":
+                    option["title"] = "Additional Keywords"
+                elif option.get("type") == "null":
+                    option["title"] = "No Additional Keywords"
+        return schema
+
+    @classmethod
+    def ui_schema(cls):
+        ui = generate_ui_schema(cls)
+        ui["field_name"] = {"ui:widget": "hidden"}
+        ui["ui:order"] = [
+            "level_of_theory",
+            "compute_gradients",
+            "optimize",
+            "additional_keywords",
+        ]
+        return ui
 
 
 @simstack_model
@@ -67,6 +118,27 @@ class CompareConformers(Model):
     rmsd_threshold: float = Field(
         default=0.5, description="RMSD threshold for matching conformers (Angstrom)"
     )
+    relaxation_method: ConformerRelaxationMethod = Field(
+        ConformerRelaxationMethod.DFTB,
+        json_schema_extra={
+            "title": "Final relaxation",
+            "description": "Relax generated conformers with the xTB or DFTB list calculator",
+        },
+    )
+    xtb_parameters: Optional[XTBListCalculatorParameters] = Field(
+        None,
+        json_schema_extra={
+            "title": "xTB list calculator",
+            "description": "Parameters for xtb_optimize_molecule_list. The molecules are the generated conformers.",
+        },
+    )
+    dftb_parameters: Optional[DftbInput] = Field(
+        None,
+        json_schema_extra={
+            "title": "DFTB list calculator",
+            "description": "Parameters for dftb_list_calculator. The molecules are the generated conformers.",
+        },
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -83,6 +155,23 @@ class CompareConformers(Model):
             data["molecule"] = None
         else:
             data["crest_input"] = None
+        if "relaxation_method" not in data:
+            method = ConformerRelaxationMethod.DFTB
+        else:
+            method = data["relaxation_method"]
+            if method is None:
+                raise ValueError("relaxation_method is required")
+            if isinstance(method, str):
+                try:
+                    method = ConformerRelaxationMethod(method)
+                except ValueError as exc:
+                    raise ValueError("relaxation_method must be xtb or dftb") from exc
+            if method not in (ConformerRelaxationMethod.XTB, ConformerRelaxationMethod.DFTB):
+                raise ValueError("relaxation_method must be xtb or dftb")
+        if method == ConformerRelaxationMethod.XTB:
+            data["dftb_parameters"] = None
+        else:
+            data["xtb_parameters"] = None
         return data
 
     @model_validator(mode="after")
@@ -96,6 +185,22 @@ class CompareConformers(Model):
                 raise ValueError("CREST parameters are required when CREST is selected")
         elif self.molecule is None:
             raise ValueError("A molecule is required when CREST is not selected")
+        if self.relaxation_method == ConformerRelaxationMethod.XTB:
+            if self.xtb_parameters is None:
+                raise ValueError(
+                    "xTB list calculator parameters are required when xTB relaxation is selected"
+                )
+            if not self.xtb_parameters.optimize:
+                raise ValueError("xTB optimization must be enabled to relax conformers")
+        elif self.relaxation_method == ConformerRelaxationMethod.DFTB:
+            if self.dftb_parameters is None:
+                raise ValueError(
+                    "DFTB list calculator parameters are required when DFTB relaxation is selected"
+                )
+            if not self.dftb_parameters.optimization:
+                raise ValueError("DFTB optimization must be enabled to relax conformers")
+        else:
+            raise ValueError("relaxation_method must be xtb or dftb")
         return self
 
     @classmethod
@@ -115,10 +220,19 @@ class CompareConformers(Model):
             molecule_schema = concrete[0]
         props.pop("ga_config", None)
         props.pop("crest_input", None)
+        props.pop("xtb_parameters", None)
+        props.pop("dftb_parameters", None)
         schema["required"] = [
             name
             for name in schema.get("required", [])
-            if name not in {"molecule", "ga_config", "crest_input"}
+            if name
+            not in {
+                "molecule",
+                "ga_config",
+                "crest_input",
+                "xtb_parameters",
+                "dftb_parameters",
+            }
         ]
 
         ga_schema = GAConformerParameters.json_schema()
@@ -131,6 +245,20 @@ class CompareConformers(Model):
         for name, definition in (crest_schema.pop("$defs", None) or {}).items():
             schema.setdefault("$defs", {}).setdefault(name, definition)
         crest_schema["title"] = "CREST"
+
+        xtb_schema = XTBListCalculatorParameters.json_schema()
+        for name, definition in (xtb_schema.pop("$defs", None) or {}).items():
+            schema.setdefault("$defs", {}).setdefault(name, definition)
+        xtb_schema["default"] = XTBListCalculatorParameters().model_dump(
+            mode="json", exclude={"id"}
+        )
+        dftb_schema = DftbInput.json_schema()
+        for name, definition in (dftb_schema.pop("$defs", None) or {}).items():
+            schema.setdefault("$defs", {}).setdefault(name, definition)
+        dftb_schema["title"] = "DFTB list calculator"
+        dftb_schema["default"] = DftbInput(
+            optimization=True, max_optimization_steps=1000
+        ).model_dump(mode="json", exclude={"id"})
 
         schema.setdefault("dependencies", {})["use_ga"] = {
             "oneOf": [
@@ -162,6 +290,24 @@ class CompareConformers(Model):
                 },
             ]
         }
+        schema["dependencies"]["relaxation_method"] = {
+            "oneOf": [
+                {
+                    "properties": {
+                        "relaxation_method": {"const": ConformerRelaxationMethod.XTB.value},
+                        "xtb_parameters": xtb_schema,
+                    },
+                    "required": ["xtb_parameters"],
+                },
+                {
+                    "properties": {
+                        "relaxation_method": {"const": ConformerRelaxationMethod.DFTB.value},
+                        "dftb_parameters": dftb_schema,
+                    },
+                    "required": ["dftb_parameters"],
+                },
+            ]
+        }
         return schema
 
     @classmethod
@@ -178,22 +324,74 @@ class CompareConformers(Model):
         ui.setdefault("ga_config", {})["ui:condition"] = {"use_ga": True}
         ui.setdefault("molecule", {})["ui:condition"] = {"use_crest": False}
         ui.setdefault("crest_input", {})["ui:condition"] = {"use_crest": True}
+        ui.setdefault("xtb_parameters", {})["ui:condition"] = {
+            "relaxation_method": ConformerRelaxationMethod.XTB.value
+        }
+        ui.setdefault("dftb_parameters", {})["ui:condition"] = {
+            "relaxation_method": ConformerRelaxationMethod.DFTB.value
+        }
         return ui
 
 
-async def _relax_conformers_dftb(
-    conformers: MoleculeList, **kwargs
+async def _relax_conformers(
+    conformers: MoleculeList, opts: CompareConformers, **kwargs
 ) -> List[Tuple[Molecule, float]]:
     """
-    Relax each conformer using DFTB with max 1000 iterations.
+    Relax each conformer with the selected list calculator.
     Returns a list of (relaxed_molecule, energy_hartree) sorted by energy ascending.
     """
-    from molecular_qm_dftb.models.dftb_input import DftbInput
+    if opts.relaxation_method == ConformerRelaxationMethod.XTB:
+        from molecular_qm_psi4.models.crest_input import XTBInput
+        from molecular_qm_psi4.nodes.crest import xtb_optimize_molecule_list
+
+        if opts.xtb_parameters is None:
+            raise ValueError(
+                "xTB list calculator parameters are required when xTB relaxation is selected"
+            )
+        xtb_input = XTBInput(
+            molecules=conformers,
+            level_of_theory=opts.xtb_parameters.level_of_theory,
+            compute_gradients=opts.xtb_parameters.compute_gradients,
+            optimize=opts.xtb_parameters.optimize,
+            additional_keywords=opts.xtb_parameters.additional_keywords,
+        )
+        calc_result = await xtb_optimize_molecule_list(xtb_input, **kwargs)
+        if getattr(calc_result, "error_message", None):
+            raise ValueError(
+                f"xtb_optimize_molecule_list failed: {calc_result.error_message}"
+            )
+        molecules_out = getattr(calc_result, "molecule_list", None)
+        if molecules_out is None:
+            node_runner = kwargs.get("node_runner")
+            molecules_out = (
+                None if node_runner is None else getattr(node_runner, "molecule_list", None)
+            )
+        if molecules_out is None:
+            raise ValueError("xtb_optimize_molecule_list did not return molecules")
+
+        relaxed_list: List[Tuple[Molecule, float]] = []
+        for molecule in molecules_out:
+            energy = molecule.properties.get("energy")
+            if energy is None:
+                logger.warning("xTB relaxation failed for a conformer")
+                continue
+            energy = float(energy)
+            molecule.properties["energy"] = energy
+            relaxed_list.append((molecule, energy))
+        relaxed_list.sort(key=lambda item: item[1])
+        return relaxed_list
+
+    if opts.relaxation_method != ConformerRelaxationMethod.DFTB:
+        raise ValueError("relaxation_method must be xtb or dftb")
+    if opts.dftb_parameters is None:
+        raise ValueError(
+            "DFTB list calculator parameters are required when DFTB relaxation is selected"
+        )
+
     from molecular_qm_dftb.nodes.dftb_list_calculator import dftb_list_calculator
     from simstack.core.context import context
 
-    dftb_opts = DftbInput(optimization=True, max_optimization_steps=1000)
-    calc_result = await dftb_list_calculator(conformers, dftb_opts, **kwargs)
+    calc_result = await dftb_list_calculator(conformers, opts.dftb_parameters, **kwargs)
 
     dataset = getattr(calc_result, "dataset", None)
     if dataset is None and hasattr(calc_result, "sections"):
@@ -259,14 +457,18 @@ async def compare_optimization_methods(
 ) -> MoleculeList:
     """
     Compare up to 4 conformer generators (GA, OpenBabel, RDKit, CREST),
-    optimize conformers using DFTB (max 1000 iterations), compute an NxN
-    aligned RMSD matrix between lowest relaxed conformers, and prepare a SimpleTable
-    of conformer ranks.
+    relax the generated conformers with either the xTB or DFTB list calculator,
+    compute an NxN aligned RMSD matrix between lowest relaxed conformers, and
+    prepare a SimpleTable of conformer ranks.
 
     The genetic algorithm runs ``run_ga_conformer_gen``. Its parameters are
     ``ga_config`` and are used only when the genetic algorithm is selected.
     CREST parameters are used only when CREST is selected. Otherwise every
     generator starts from ``molecule``.
+
+    ``relaxation_method`` selects the final relaxation. xTB exposes
+    ``xtb_parameters`` for ``xtb_optimize_molecule_list``. DFTB exposes
+    ``dftb_parameters`` for ``dftb_list_calculator``.
 
     Called Nodes:
         run_ga_conformer_gen
@@ -274,6 +476,7 @@ async def compare_optimization_methods(
         conformers_rdkit
         crest
         dftb_list_calculator
+        xtb_optimize_molecule_list
     """
     node_runner = kwargs.get("node_runner")
 
@@ -373,13 +576,16 @@ async def compare_optimization_methods(
                 node_runner.warning(f"Failed generating conformers for {method_label}: {exc}")
             generated_by_method[method_label] = MoleculeList()
 
-    # 2. Relax conformers with DFTB (1000 max iterations)
+    # 2. Relax conformers with the selected list calculator
     relaxed_by_method: Dict[str, List[Tuple[Molecule, float]]] = {}
     for method_label, confs in generated_by_method.items():
         if len(confs) > 0:
             if node_runner is not None:
-                node_runner.info(f"Relaxing {len(confs)} conformers for {method_label} with DFTB...")
-            relaxed_sorted = await _relax_conformers_dftb(confs, **kwargs)
+                node_runner.info(
+                    f"Relaxing {len(confs)} conformers for {method_label} "
+                    f"with {opts.relaxation_method.value}..."
+                )
+            relaxed_sorted = await _relax_conformers(confs, opts, **kwargs)
             relaxed_by_method[method_label] = relaxed_sorted
         else:
             relaxed_by_method[method_label] = []

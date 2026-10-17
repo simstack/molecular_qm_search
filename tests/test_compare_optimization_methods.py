@@ -1,12 +1,16 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
+from molecular_qm_dftb.models.dftb_input import DftbInput
 from molecular_qm_models import Atom, Molecule, MoleculeList
-from molecular_qm_psi4.models.crest_input import CrestInput
+from molecular_qm_psi4.models.crest_input import CrestInput, CrestLevelOfTheoryEnum
 from molecular_qm_search.optimization.compare_optimization_methods import (
     CompareConformers,
+    ConformerRelaxationMethod,
+    XTBListCalculatorParameters,
     compare_optimization_methods,
 )
 from molecular_qm_search.optimization.models.ga_models import (
@@ -18,6 +22,12 @@ from molecular_qm_search.optimization.models.ga_models import (
 
 def _carbon():
     return Molecule(atoms=[Atom(element="C", x=0.0, y=0.0, z=0.0)])
+
+
+def _dftb(**overrides):
+    values = {"optimization": True, "max_optimization_steps": 1000}
+    values.update(overrides)
+    return DftbInput(**values)
 
 
 def _runner():
@@ -81,6 +91,41 @@ def test_schema_exposes_ga_parameters_only_when_selected_and_crest_only_when_on(
     assert "molecule" not in crest_on["properties"]
 
 
+def test_schema_exposes_only_the_selected_relaxation_calculator():
+    schema = CompareConformers.json_schema()
+    assert "xtb_parameters" not in schema["properties"]
+    assert "dftb_parameters" not in schema["properties"]
+    assert schema["properties"]["relaxation_method"]["default"] == "dftb"
+
+    by_method = {
+        arm["properties"]["relaxation_method"]["const"]: arm
+        for arm in schema["dependencies"]["relaxation_method"]["oneOf"]
+    }
+    xtb_arm = by_method["xtb"]
+    assert xtb_arm["required"] == ["xtb_parameters"]
+    assert "dftb_parameters" not in xtb_arm["properties"]
+    xtb_schema = xtb_arm["properties"]["xtb_parameters"]
+    assert "anyOf" not in xtb_schema
+    assert "molecules" not in xtb_schema["properties"]
+    for name in ("level_of_theory", "compute_gradients", "optimize", "additional_keywords"):
+        assert name in xtb_schema["properties"]
+    assert xtb_schema["default"]["optimize"] is True
+    assert xtb_schema["default"]["level_of_theory"]["method"] == CrestLevelOfTheoryEnum.GFN2_XTB.value
+
+    dftb_arm = by_method["dftb"]
+    assert dftb_arm["required"] == ["dftb_parameters"]
+    assert "xtb_parameters" not in dftb_arm["properties"]
+    dftb_schema = dftb_arm["properties"]["dftb_parameters"]
+    assert "anyOf" not in dftb_schema
+    for name in ("charge", "hamiltonian", "optimization", "scc_tolerance"):
+        assert name in dftb_schema["properties"]
+    optimization_on = dftb_schema["dependencies"]["optimization"]["oneOf"][1]
+    for name in ("optimization_method", "max_optimization_steps", "force_tolerance"):
+        assert name in optimization_on["properties"]
+    assert dftb_schema["default"]["optimization"] is True
+    assert dftb_schema["default"]["max_optimization_steps"] == 1000
+
+
 def test_ui_conditions_follow_the_selected_generator():
     ui = CompareConformers.ui_schema()
     assert ui["ga_config"]["ui:field"] == "GenericFormField"
@@ -93,6 +138,12 @@ def test_ui_conditions_follow_the_selected_generator():
     assert ui["molecule"]["ui:condition"] == {"use_crest": False}
     assert ui["use_ga"]["ui:widget"] == "checkbox"
     assert ui["use_crest"]["ui:widget"] == "checkbox"
+    assert ui["xtb_parameters"]["ui:field"] == "GenericFormField"
+    assert ui["xtb_parameters"]["ui:condition"] == {"relaxation_method": "xtb"}
+    assert ui["xtb_parameters"]["ui:options"]["model"].endswith("XTBListCalculatorParameters")
+    assert ui["dftb_parameters"]["ui:field"] == "GenericFormField"
+    assert ui["dftb_parameters"]["ui:condition"] == {"relaxation_method": "dftb"}
+    assert ui["dftb_parameters"]["ui:options"]["model"].endswith("DftbInput")
 
 
 def test_disabled_generator_parameters_are_cleared_and_missing_ones_rejected():
@@ -109,12 +160,38 @@ def test_disabled_generator_parameters_are_cleared_and_missing_ones_rejected():
     with pytest.raises(ValidationError, match="CREST parameters are required"):
         CompareConformers(use_ga=False, use_crest=True)
 
+    with pytest.raises(ValidationError, match="DFTB list calculator parameters are required"):
+        CompareConformers(use_ga=False, molecule=molecule)
+
+    with pytest.raises(ValidationError, match="xTB list calculator parameters are required"):
+        CompareConformers(
+            use_ga=False,
+            molecule=molecule,
+            relaxation_method=ConformerRelaxationMethod.XTB,
+        )
+
+    with pytest.raises(ValidationError, match="DFTB optimization must be enabled"):
+        CompareConformers(
+            use_ga=False,
+            molecule=molecule,
+            dftb_parameters=DftbInput(optimization=False),
+        )
+
+    with pytest.raises(ValidationError, match="xTB optimization must be enabled"):
+        CompareConformers(
+            use_ga=False,
+            molecule=molecule,
+            relaxation_method=ConformerRelaxationMethod.XTB,
+            xtb_parameters=XTBListCalculatorParameters(optimize=False),
+        )
+
     crest_only = CompareConformers(
         use_ga=False,
         use_crest=True,
         molecule=molecule,
         crest_input=crest_input,
         ga_config=ga_config,
+        dftb_parameters=_dftb(),
     )
     assert crest_only.molecule is None
     assert crest_only.ga_config is None
@@ -125,12 +202,29 @@ def test_disabled_generator_parameters_are_cleared_and_missing_ones_rejected():
         molecule=molecule,
         ga_config=ga_config,
         crest_input=crest_input,
+        dftb_parameters=_dftb(charge=-1),
+        xtb_parameters=XTBListCalculatorParameters(compute_gradients=True),
     )
     assert ga_only.use_ga is True
     assert ga_only.crest_input is None
     assert ga_only.molecule is molecule
     assert ga_only.ga_config.num_confs == 12
     assert ga_only.ga_config.generations == 4
+    assert ga_only.relaxation_method is ConformerRelaxationMethod.DFTB
+    assert ga_only.xtb_parameters is None
+    assert ga_only.dftb_parameters.charge == -1
+    assert ga_only.dftb_parameters.max_optimization_steps == 1000
+
+    xtb_only = CompareConformers(
+        use_ga=False,
+        molecule=molecule,
+        relaxation_method=ConformerRelaxationMethod.XTB,
+        xtb_parameters=XTBListCalculatorParameters(compute_gradients=True),
+        dftb_parameters=_dftb(),
+    )
+    assert xtb_only.dftb_parameters is None
+    assert xtb_only.xtb_parameters.compute_gradients is True
+    assert xtb_only.xtb_parameters.optimize is True
 
 
 @pytest.mark.asyncio
@@ -174,6 +268,7 @@ async def test_ga_selection_calls_ga_conformer_gen_with_its_parameters(monkeypat
         use_crest=False,
         molecule=molecule,
         ga_config=ga_config,
+        dftb_parameters=_dftb(),
     )
     result = await compare_optimization_methods.__wrapped__(opts, node_runner=_runner())
 
@@ -219,6 +314,7 @@ async def test_crest_parameters_are_used_only_when_crest_is_selected(monkeypatch
         use_crest=False,
         molecule=molecule,
         ga_config=GAConformerParameters(),
+        dftb_parameters=_dftb(),
     )
     await compare_optimization_methods.__wrapped__(off, node_runner=_runner())
     assert crest_calls == []
@@ -229,7 +325,86 @@ async def test_crest_parameters_are_used_only_when_crest_is_selected(monkeypatch
         use_crest=True,
         crest_input=CrestInput(molecule=molecule),
         ga_config=GAConformerParameters(num_confs=8),
+        dftb_parameters=_dftb(),
     )
     await compare_optimization_methods.__wrapped__(on, node_runner=_runner())
     assert len(crest_calls) == 1
     assert crest_calls[0].molecule is molecule
+
+
+@pytest.mark.asyncio
+async def test_relaxation_calls_the_selected_list_calculator(monkeypatch):
+    molecule = _carbon()
+    calls = []
+
+    def babel(mol, cg_input, **kwargs):
+        generated = MoleculeList()
+        generated.append(Molecule.from_molecule(mol))
+        return generated
+
+    async def fake_dftb(molecules, opts, **kwargs):
+        calls.append(("dftb", opts, len(molecules)))
+        relaxed = Molecule.from_molecule(molecule)
+        row = {
+            "success": True,
+            "result_qm_result": SimpleNamespace(final_structure=relaxed, final_energy=-1.0),
+        }
+        return SimpleNamespace(dataset={"results": {"row": row}})
+
+    async def fake_xtb(xtb_input, **kwargs):
+        calls.append(("xtb", xtb_input))
+        relaxed = Molecule.from_molecule(molecule)
+        relaxed.properties["energy"] = -0.4
+        generated = MoleculeList()
+        generated.append(relaxed)
+        return SimpleNamespace(molecule_list=generated)
+
+    monkeypatch.setattr(
+        "molecular_qm_util.obabel_scripts.openbabel_conformers.conformers_openbabel",
+        babel,
+    )
+    import molecular_qm_dftb.nodes.dftb_list_calculator  # noqa: F401
+    monkeypatch.setattr(
+        sys.modules["molecular_qm_dftb.nodes.dftb_list_calculator"],
+        "dftb_list_calculator",
+        fake_dftb,
+    )
+    monkeypatch.setattr(
+        "molecular_qm_psi4.nodes.crest.xtb_optimize_molecule_list",
+        fake_xtb,
+    )
+
+    dftb_opts = _dftb(max_optimization_steps=40, charge=2)
+    dftb_run = CompareConformers(
+        use_ga=False,
+        use_babel=True,
+        use_rdkit=False,
+        use_crest=False,
+        molecule=molecule,
+        dftb_parameters=dftb_opts,
+    )
+    result = await compare_optimization_methods.__wrapped__(dftb_run, node_runner=_runner())
+    assert len(result) == 1
+    assert result[0].properties["energy"] == -1.0
+    assert calls[-1] == ("dftb", dftb_opts, 1)
+
+    xtb_opts = XTBListCalculatorParameters(
+        compute_gradients=True,
+        additional_keywords="--gfn 1",
+    )
+    xtb_run = CompareConformers(
+        use_ga=False,
+        use_babel=True,
+        molecule=molecule,
+        relaxation_method=ConformerRelaxationMethod.XTB,
+        xtb_parameters=xtb_opts,
+    )
+    await compare_optimization_methods.__wrapped__(xtb_run, node_runner=_runner())
+    kind, xtb_input = calls[-1]
+    assert kind == "xtb"
+    assert len(calls) == 2
+    assert xtb_input.optimize is True
+    assert xtb_input.compute_gradients is True
+    assert xtb_input.additional_keywords == "--gfn 1"
+    assert xtb_input.level_of_theory.method is CrestLevelOfTheoryEnum.GFN2_XTB
+    assert len(xtb_input.molecules) == 1
