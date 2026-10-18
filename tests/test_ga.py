@@ -288,6 +288,27 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
     assert {key for row in runner.diversity_chart.data for key in row} == {"pc1", "pc2"}
 
 
+def test_success_rate_counts_a_rejected_child_once(molecule, coordinates):
+    ga = StandardGA(
+        molecule, logging.getLogger("test"), evaluator=Evaluator(), coordinates=coordinates,
+        pop_size=1, generations=0, mutation_rate=1.0, dihedral_interval=90, seed=1,
+        prune_rms_thresh=0.1,
+    )
+    ga.setup()
+    ga._history.append({"op": "I", "index": 0})
+    seed = (copy.deepcopy(ga.template_coords), "initial", 1.0, 0)
+    kept = ga._select_next_population([(1.0, seed[0], "initial", 0)], 0)
+    assert ga.success_stats["initial"] == [1, 1]
+    mutation = next(origin for origin in ga.success_stats if origin.startswith("mutation-"))
+    assert ga.success_stats[mutation] == [0, 1]
+    ga._select_next_population([
+        (energy, coords, origin, history_index)
+        for coords, origin, energy, history_index in kept
+    ], 1)
+    assert ga.success_stats["initial"] == [1, 1]
+    assert ga.success_stats[mutation] == [0, 2]
+
+
 def test_charts_refresh_on_every_iteration(molecule, coordinates, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     runner = RecordingRunner()

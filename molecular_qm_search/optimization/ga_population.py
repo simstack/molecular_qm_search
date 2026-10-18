@@ -213,7 +213,7 @@ class PopulationGenerator:
             population.append((individual, "initial", None))
         return population
 
-    def reproduce(self, parents, target_size, prune_rms_thresh, history):
+    def reproduce(self, parents, target_size, prune_rms_thresh, history, *, neighbor_edges=None):
         """Carry parents once and append new mutations or crossovers.
 
         Each parent is ``(coordinates, origin, energy, history_index)``.
@@ -228,6 +228,8 @@ class PopulationGenerator:
         After ``target_size - len(parents)`` discarded proposals in a row, the
         returned population is shorter than requested. ``last_rejection`` is
         ``noop`` when that happens, and ``rejected_rmsd`` stays unset.
+        ``neighbor_edges`` restricts crossover to those pairs of parent indexes.
+        An empty edge list raises ``ValueError`` when a crossover is required.
         """
         if not isinstance(history, list):
             raise ValueError("GA history must be a list")
@@ -261,6 +263,26 @@ class PopulationGenerator:
             "rejected_noop": 0,
             "closest_rejected_rmsd": None,
         }
+        resolved_edges = None
+        if neighbor_edges is not None:
+            resolved_edges = []
+            for edge in neighbor_edges:
+                if not isinstance(edge, tuple) or len(edge) != 2:
+                    raise ValueError(
+                        f"Neighbor edge must be a pair of population indexes, got {edge!r}"
+                    )
+                left, right = edge
+                if (
+                    isinstance(left, bool) or isinstance(right, bool)
+                    or not isinstance(left, int) or not isinstance(right, int)
+                    or left == right
+                    or not 0 <= left < len(parents)
+                    or not 0 <= right < len(parents)
+                ):
+                    raise ValueError(
+                        f"Neighbor edge {edge!r} is not a pair of distinct population indexes"
+                    )
+                resolved_edges.append((left, right))
         child_quota = target_size - len(parents)
         rejected = 0
         n_coords = len(self.coordinates.elements)
@@ -299,7 +321,16 @@ class PopulationGenerator:
                 if n_coords == 0:
                     child, origin = None, None
                 else:
-                    first, second = self.random.sample(parents, 2)
+                    if resolved_edges is not None:
+                        if not resolved_edges:
+                            raise ValueError(
+                                "Crossover requires a neighbor edge, and the weighted "
+                                "neighbor graph has none"
+                            )
+                        left, right = self.random.choice(resolved_edges)
+                        first, second = parents[left], parents[right]
+                    else:
+                        first, second = self.random.sample(parents, 2)
                     point = self.random.randrange(n_coords)
                     child = InternalCoordinatesList(elements=copy.deepcopy(
                         first[0].elements[:point] + second[0].elements[point:]

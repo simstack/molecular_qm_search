@@ -111,8 +111,10 @@ class BaseGA:
         self.energy_history: List[Dict[str, float]] = []
         self._energy_plot_start: Optional[int] = None
         self.artifact_loop = artifact_loop
-        # [elite survivors, produced] for each population-change label.
+        # [kept after selection, produced] for each population-change label.
+        # Each conformer is counted once, on the generation that creates it.
         self.success_stats: Dict[str, List[int]] = {}
+        self._counted_history: set[int] = set()
 
         if pop_size < 1 or num_confs < 1 or generations < 0:
             raise ValueError("Population and conformer counts must be positive; generations cannot be negative")
@@ -167,6 +169,7 @@ class BaseGA:
             "gen": gen,
             "best_stored": self.best_stored,
             "success_stats": self.success_stats,
+            "counted_history": sorted(self._counted_history),
             "energy_history": self.energy_history,
             "best_energy_seen": self.best_energy_seen,
             "random_state": self.population_generator.random.getstate(),
@@ -196,6 +199,8 @@ class BaseGA:
             raise ValueError("GA checkpoint has no energy_history")
         if "success_stats" not in state:
             raise ValueError("GA checkpoint has no success_stats")
+        if "counted_history" not in state or not isinstance(state["counted_history"], list):
+            raise ValueError("GA checkpoint has no counted history indexes")
         population = state.get("population")
         if not population or any(
             not isinstance(item, tuple) or len(item) != 4 or item[2] is None for item in population
@@ -210,6 +215,7 @@ class BaseGA:
                 raise ValueError(f"Configuration {history_index} is not in the GA history")
         self.best_stored = state.get("best_stored", MoleculeList())
         self.success_stats = state["success_stats"]
+        self._counted_history = set(state["counted_history"])
         self.energy_history = state["energy_history"]
         self.best_energy_seen = state.get("best_energy_seen", float('inf'))
         if hasattr(self, "rmsd_history") and "rmsd_history" in state:
@@ -606,6 +612,14 @@ class BaseGA:
                 f"closest pair is {float(nearest_pair):.4f} degrees, "
                 f"at or above prune_rms_thresh {self.prune_rms_thresh}"
             )
+        kept_indexes = {history_index for _, _, _, history_index in kept}
+        for _, origin, _, history_index in proposed:
+            if history_index in self._counted_history:
+                continue
+            if not isinstance(history_index, int):
+                raise ValueError(f"Configuration {history_index} has no history index")
+            self._counted_history.add(history_index)
+            self._count_origin(origin, elite=history_index in kept_indexes)
         self._report(
             f"Gen {gen}: parents {len(parents)}; "
             f"children accepted {stats['accepted']}, "
@@ -944,7 +958,7 @@ class BaseGA:
         table.add_column("produced", SimpleTableColumnType.NUMBER)
         table.add_column("elite_survivors", SimpleTableColumnType.NUMBER)
         table.add_column("success_rate", SimpleTableColumnType.NUMBER)
-        self._report("\n--- GA Success Rates (Elite Survival) ---")
+        self._report("\n--- GA Success Rates (changes kept after selection) ---")
         for origin, counts in self.success_stats.items():
             if len(counts) != 2:
                 raise ValueError(f"Success counts for {origin} are not usable: {counts}")
@@ -1029,7 +1043,7 @@ class BaseGA:
         if not self.template_coords.elements:
             self._report("No rotatable bonds found.")
             evaluated = self.evaluate_molecules(
-                [self.initial_mol], optimize=type(self) is not StandardGA,
+                [self.initial_mol], optimize=not isinstance(self, StandardGA),
             )
             evaluated = [
                 molecule for molecule in evaluated if not self._force_field_discarded(molecule)
@@ -1146,7 +1160,7 @@ class BaseGA:
         self.timing["GA Loop"] = time.perf_counter() - t1
         molecules = self.finalize(population)
         returned = list(molecules)
-        cap = self.pop_size if type(self) is StandardGA else self.num_confs
+        cap = self.pop_size if isinstance(self, StandardGA) else self.num_confs
         if not 1 <= len(returned) <= cap:
             raise ValueError(
                 f"Expected between 1 and {cap} population molecules, got {len(returned)}"
@@ -1160,11 +1174,6 @@ class BaseGA:
             gen: int
     ):
         scored_pop.sort(key=lambda x: x[0])
-        elite_size = max(1, int(self.pop_size * 0.2))
-        elite_count = min(len(scored_pop), elite_size)
-        for index, (_, _, origin, _) in enumerate(scored_pop):
-            self._count_origin(origin, elite=index < elite_count)
-
         return self._select_next_population(scored_pop, gen)
 
     def post_generation_hook(self, population: List[InternalCoordinatesList], gen: int):
@@ -1322,10 +1331,6 @@ class DiversityGA(BaseGA):
             raise RuntimeError("DiversityGA.selection received an empty population.")
 
         scored_pop.sort(key=lambda x: x[0])
-        elite_size = min(len(scored_pop), max(1, int(self.pop_size * 0.2)))
-        for index, (_, _, origin, _) in enumerate(scored_pop):
-            self._count_origin(origin, elite=index < elite_size)
-
         min_energy = scored_pop[0][0]
         threshold = min_energy + 0.1 * abs(min_energy)
         accepted = [item for item in scored_pop if item[0] <= threshold]

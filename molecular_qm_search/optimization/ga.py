@@ -39,7 +39,7 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
         energy_histogram (ChartArtifactModel): Histogram of the population energies, updated every iteration
         diversity_chart (ChartArtifactModel): PCA of pairwise dihedral RMSD, updated every iteration when the population has at least two conformers
         dihedral_histogram_0, dihedral_histogram_1, ... (ChartArtifactModel): Count of conformers in 30 degree bins for each rotatable dihedral, updated every iteration and again from the returned molecules
-        operator_stats (SimpleTable): Elite-survival rate of each population-change type
+        operator_stats (SimpleTable): Fraction of new conformers of each change type that selection kept
         conformation_energies (SimpleTable): Last scored population, sorted by energy, one row per conformer. The history column starts with that conformer's creation index and walks back to the input: M,ancestor,dihedral,angle or X,ancestor1,ancestor2,cut, ending at I,0
     """
     node_runner = kwargs.get("node_runner")

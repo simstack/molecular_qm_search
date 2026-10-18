@@ -13,6 +13,7 @@ dependencies = [
     "molecular_qm_util",
     "molecular_qm_dftb",
     "molecular_qm_psi4",
+    "scikit-learn",
     "simstack",
 ]
 
