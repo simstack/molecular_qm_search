@@ -34,7 +34,7 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
         ValueError: missing initial molecule, unknown mode, or invalid GA settings
 
     SimstackResult:
-        molecules (MoleculeList): Population that survived the last selection, lowest single-point energy first. The standard GA does not relax these geometries.
+        molecules (MoleculeList): Population that survived the last selection, lowest single-point energy first. The input geometry is minimized with the selected method before the search. The standard GA does not relax the returned geometries.
         energy_chart (ChartArtifactModel): Minimum and maximum population energy versus iteration, updated every iteration
         energy_histogram (ChartArtifactModel): Histogram of the population energies, updated every iteration
         diversity_chart (ChartArtifactModel): PCA of pairwise dihedral RMSD, updated every iteration when the population has at least two conformers

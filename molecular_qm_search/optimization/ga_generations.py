@@ -46,7 +46,7 @@ def ga_generation_lists(
 ) -> list[MoleculeList]:
     """Run three GA iterations at population size 10 and return each scored generation.
 
-    Iteration 0 is the input geometry alone. Later iterations are the populations
+    Iteration 0 is the minimized input geometry alone. Later iterations are the populations
     kept by selection. Geometries are the
     structures that were scored, before the final force-field optimization.
     """
@@ -102,7 +102,7 @@ async def inspect_ga_generations(molecule: Molecule, **kwargs) -> SimstackResult
         ValueError: the molecule has no atoms, or a generation was not captured.
 
     SimstackResult:
-        generation_0 (MoleculeList): The input geometry, scored once. generation_1 and generation_2 are the later scored populations, ordered by energy.
+        generation_0 (MoleculeList): The minimized input geometry, scored once. generation_1 and generation_2 are the later scored populations, ordered by energy.
     """
     node_runner = kwargs.get("node_runner")
     if node_runner is None:

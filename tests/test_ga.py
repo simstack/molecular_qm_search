@@ -45,7 +45,7 @@ class Evaluator:
         self.calls.append(("optimize", len(molecules), max_iters))
         results = [Molecule.from_molecule(m) for m in molecules]
         for molecule in results:
-            molecule.atoms[0].y = 2.5
+            molecule.atoms[0].y = 1.01
             molecule.properties.update(energy=-2.0, energy_unit="kcal/mol", method="test")
         return results
 
@@ -158,12 +158,13 @@ def test_modes_use_injected_backend_and_preserve_final_geometry(
     result = ga.run()
     assert result
     if ga_class is StandardGA:
-        assert all(call[0] != "optimize" for call in evaluator.calls)
+        assert evaluator.calls[0] == ("optimize", 1, ga.max_iters)
+        assert all(call[0] != "optimize" for call in evaluator.calls[1:])
         assert any(call[0] == "score" for call in evaluator.calls)
         assert all(m.properties["energy"] == 5.0 for m in result)
     else:
         assert any(call[0] == "optimize" for call in evaluator.calls)
-        assert all(m.atoms[0].y == 2.5 for m in result)
+        assert all(m.atoms[0].y == 1.01 for m in result)
         assert all(m.properties["energy"] == -2 for m in result)
         assert all(m.properties["method"] == "test" for m in result)
         if ga_class is not MinimizingGA:
@@ -175,8 +176,10 @@ def test_rigid_molecule_uses_backend_without_rdkit(molecule, tmp_path, monkeypat
     evaluator = Evaluator()
     ga = StandardGA(molecule, logging.getLogger("test"), evaluator=evaluator,
                     coordinates=InternalCoordinatesList())
-    assert len(ga.run()) == 1
-    assert evaluator.calls == [("score", 1)]
+    result = ga.run()
+    assert len(result) == 1
+    assert evaluator.calls == [("optimize", 1, 500), ("score", 1)]
+    assert result[0].atoms[0].y == 1.01
 
 
 def test_smart_optimization_preserves_order_and_partial_results(molecule, coordinates):
@@ -247,7 +250,8 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
         row["energy"] for row in runner.conformation_energies.row
     ]
     assert "Population:     12" in runner.log_string
-    assert "Seed population: the input geometry alone" in runner.log_string
+    assert "Seed population: the minimized input geometry alone" in runner.log_string
+    assert "Minimized the input geometry" in runner.log_string
     assert "at or above prune_rms_thresh" in runner.log_string
     assert "Dihedral Types:" in runner.log_string
     assert runner.log_string == "\n".join(runner.info_messages) + "\n"
@@ -396,6 +400,24 @@ def test_restart_restores_generator_random_state(molecule, coordinates, tmp_path
     assert [p.elements[0].value for p, *_ in actual] == [p.elements[0].value for p, *_ in expected]
 
 
+def test_restart_keeps_the_minimized_geometry(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    evaluator = Evaluator()
+    ga = StandardGA(
+        molecule, logging.getLogger("test"), evaluator=evaluator, coordinates=coordinates,
+        pop_size=2, generations=0, mutation_rate=1.0,
+    )
+    ga.run()
+    assert evaluator.calls[0] == ("optimize", 1, 500)
+    resumed = StandardGA(
+        molecule, logging.getLogger("test"), evaluator=evaluator, coordinates=coordinates,
+        pop_size=2, generations=1, mutation_rate=1.0, restart=True,
+    )
+    resumed.run()
+    assert [call for call in evaluator.calls if call[0] == "optimize"] == [("optimize", 1, 500)]
+    assert resumed.initial_mol.atoms[0].y == 1.01
+
+
 def test_later_generations_score_only_new_conformers(molecule, coordinates, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     evaluator = Evaluator()
@@ -516,7 +538,8 @@ def test_relaxation_into_one_well_does_not_drop_the_population(molecule, coordin
     )
     result = list(ga.run())
     assert len(result) == 3
-    assert all(call[0] != "optimize" for call in ga.evaluator.calls)
+    assert ga.evaluator.calls[0] == ("optimize", 1, 500)
+    assert all(call[0] != "optimize" for call in ga.evaluator.calls[1:])
     assert "UFF relaxation is not applied" in runner.log_string
     assert "returning 3" in runner.log_string
 
@@ -579,6 +602,24 @@ def test_reproduction_rejects_a_parent_missing_from_history(molecule, coordinate
 def test_non_positive_prune_threshold_is_rejected(molecule, coordinates):
     with pytest.raises(ValueError, match="prune_rms_thresh"):
         StandardGA(molecule, logging.getLogger("test"), coordinates=coordinates, prune_rms_thresh=0)
+
+
+def test_input_minimization_failure_stops_the_search(molecule):
+    class DiscardingEvaluator(Evaluator):
+        def optimize(self, molecules, *, max_iters):
+            self.calls.append(("optimize", len(molecules), max_iters))
+            result = Molecule.from_molecule(molecules[0])
+            result.properties["energy"] = 1.0
+            result.properties["force_field_discarded"] = True
+            result.properties["force_field_gradient"] = 1.0
+            return [result]
+
+    ga = StandardGA(
+        molecule, logging.getLogger("test"), evaluator=DiscardingEvaluator(),
+        coordinates=InternalCoordinatesList(),
+    )
+    with pytest.raises(ValueError, match="high force-field gradient"):
+        ga.run()
 
 
 def test_checkpoint_without_energies_is_rejected(molecule, coordinates, tmp_path, monkeypatch):

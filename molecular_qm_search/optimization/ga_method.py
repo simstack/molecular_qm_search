@@ -174,6 +174,9 @@ class BaseGA:
             "best_energy_seen": self.best_energy_seen,
             "random_state": self.population_generator.random.getstate(),
             "history": self._history,
+            "minimized_start": PopulationGenerator._copy_molecule(
+                self.population_generator.molecule
+            ),
         }
         if hasattr(self, "rmsd_history"):
             state["rmsd_history"] = self.rmsd_history
@@ -228,6 +231,10 @@ class BaseGA:
             for (coords, _, _, _), molecule in zip(population, relaxed):
                 if molecule is not None:
                     self.relaxed[id(coords)] = molecule
+        minimized_start = state.get("minimized_start")
+        if minimized_start is None:
+            raise ValueError("GA checkpoint has no minimized starting geometry")
+        self._replace_search_geometry(minimized_start)
         self._report(f"Loaded GA state from generation {state['gen']}.")
         return population, state["gen"]
 
@@ -251,6 +258,14 @@ class BaseGA:
             for c in self.template_coords.elements
         ]
         self._bonded_pairs = self._bonds_of(self.initial_mol)
+        self._set_dihedral_symmetries()
+        bind_connectivity = getattr(self.evaluator, "bind_connectivity", None)
+        if bind_connectivity is not None:
+            bind_connectivity(self.initial_mol)
+        self.timing["Setup"] = time.perf_counter() - t0
+
+    def _set_dihedral_symmetries(self):
+        """Record the angle between equivalent terminal hydrogens on the current geometry."""
         self._dihedral_symmetries = []
         for coord in self.template_coords.elements:
             atom1, atom2, atom3, atom4 = (int(index) for index in coord.atom_indices)
@@ -284,10 +299,18 @@ class BaseGA:
                     f"Dihedral {tuple(coord.atom_indices)} hydrogens do not define a symmetry shift"
                 )
             self._dihedral_symmetries.append(shift)
-        bind_connectivity = getattr(self.evaluator, "bind_connectivity", None)
-        if bind_connectivity is not None:
-            bind_connectivity(self.initial_mol)
-        self.timing["Setup"] = time.perf_counter() - t0
+
+    def _replace_search_geometry(self, molecule: Molecule) -> None:
+        """Apply later dihedrals to this Cartesian structure."""
+        elements = [atom.element for atom in molecule.atoms]
+        if elements != [atom.element for atom in self.initial_mol.atoms]:
+            raise ValueError("Search geometry does not match the input atom sequence")
+        self.initial_mol = molecule
+        self.population_generator.molecule = PopulationGenerator._copy_molecule(molecule)
+        for coord in self.population_generator.coordinates.elements:
+            coord.compute(self.population_generator.molecule)
+        self.template_coords = self.population_generator.coordinates
+        self._set_dihedral_symmetries()
 
     def _covalent_radius(self, element: str) -> float:
         if element not in _COVALENT_RADII:
@@ -996,10 +1019,28 @@ class BaseGA:
 
     def run(self) -> MoleculeList:
         self.setup()
+        loaded = self.load_state() if self.restart else None
+        if loaded is None:
+            minimized = self.evaluate_molecules([self.initial_mol], optimize=True)
+            if len(minimized) != 1:
+                raise ValueError(
+                    f"Minimization of the input geometry returned {len(minimized)} molecules"
+                )
+            molecule = minimized[0]
+            if self._force_field_discarded(molecule):
+                raise ValueError(
+                    "Minimization of the input geometry left a high force-field gradient"
+                )
+            self._replace_search_geometry(molecule)
+            self._report(
+                "Minimized the input geometry with "
+                f"{type(self.evaluator).__name__} to "
+                f"{float(molecule.properties['energy']):.6g} kcal/mol before the search."
+            )
         self._report("\n--- GA Parameters ---")
         self._report(f"Atoms:          {len(self.initial_mol.atoms)}")
         self._report(f"Population:     {self.pop_size}")
-        self._report("Seed:           input geometry only")
+        self._report("Seed:           minimized input geometry")
         self._report(f"Generations:    {self.generations}")
         self._report(f"Mutation Rate:  {self.mutation_rate}")
         self._report(f"Crossover Rate: {1 - self.mutation_rate}")
@@ -1018,7 +1059,8 @@ class BaseGA:
         if hasattr(self, "prune_rms_thresh"):
             self._report(f"Prune RMS:      {getattr(self, 'prune_rms_thresh')}")
         self._report(
-            "Population evolution: pop_size "
+            "Population evolution: the input geometry is minimized with the selected "
+            "method before the first generation. pop_size "
             f"({self.pop_size}) is the maximum live population. Each generation proposes "
             "that many children, scores them, and keeps the lower-energy conformer when "
             "a child is within prune_rms_thresh "
@@ -1041,6 +1083,8 @@ class BaseGA:
         self._report("---------------------\n")
 
         if not self.template_coords.elements:
+            if loaded is not None:
+                raise ValueError("Restarted GA has no rotatable bonds")
             self._report("No rotatable bonds found.")
             evaluated = self.evaluate_molecules(
                 [self.initial_mol], optimize=not isinstance(self, StandardGA),
@@ -1076,11 +1120,9 @@ class BaseGA:
 
         start_gen = 0
         population = None
-        if self.restart:
-            loaded = self.load_state()
-            if loaded:
-                population, start_gen = loaded
-                start_gen += 1  # Start from the next generation
+        if loaded is not None:
+            population, start_gen = loaded
+            start_gen += 1
 
         if population is None:
             generated = self.population_generator.generate(1)
@@ -1092,7 +1134,7 @@ class BaseGA:
             self._history.append({"op": "I", "index": 0})
             population = [(coords, origin, energy, 0)]
             self._report(
-                "Seed population: the input geometry alone. "
+                "Seed population: the minimized input geometry alone. "
                 "Later conformers come from mutation and crossover."
             )
 
@@ -1198,7 +1240,7 @@ class BaseGA:
 
 
 class StandardGA(BaseGA):
-    """Score generated geometries; optimize only the final population."""
+    """Minimize the input, then score generated geometries without relaxing them."""
 
     def finalize(self, population) -> MoleculeList:
         ordered = sorted(population, key=lambda item: (float(item[2]), item[1]))
