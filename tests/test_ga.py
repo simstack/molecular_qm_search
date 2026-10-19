@@ -242,7 +242,7 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
     ga = StandardGA(
         molecule, runner, evaluator=DistinctGeometryEvaluator(), coordinates=coordinates,
         pop_size=12, num_confs=6, generations=2, mutation_rate=1.0, seed=1,
-        prune_rms_thresh=0.1,
+        prune_rms_thresh=0.1, heavy_atom_rmsd_thresh=1e-6,
     )
     conformers = ga.run()
     assert len(conformers) == 12
@@ -333,7 +333,7 @@ def test_charts_refresh_on_every_iteration(molecule, coordinates, tmp_path, monk
     ga = StandardGA(
         molecule, runner, evaluator=WatchingEvaluator(), coordinates=coordinates,
         pop_size=4, num_confs=4, generations=2, mutation_rate=1.0, seed=1,
-        prune_rms_thresh=0.1,
+        prune_rms_thresh=0.1, heavy_atom_rmsd_thresh=1e-6,
     )
     ga.run()
     assert seen == [
@@ -602,6 +602,61 @@ def test_reproduction_rejects_a_parent_missing_from_history(molecule, coordinate
 def test_non_positive_prune_threshold_is_rejected(molecule, coordinates):
     with pytest.raises(ValueError, match="prune_rms_thresh"):
         StandardGA(molecule, logging.getLogger("test"), coordinates=coordinates, prune_rms_thresh=0)
+    with pytest.raises(ValueError, match="heavy_atom_rmsd_thresh"):
+        StandardGA(
+            molecule, logging.getLogger("test"), coordinates=coordinates,
+            heavy_atom_rmsd_thresh=0,
+        )
+    with pytest.raises(ValueError, match="heavy_atom_rmsd_thresh"):
+        StandardGA(
+            molecule, logging.getLogger("test"), coordinates=coordinates,
+            heavy_atom_rmsd_thresh=None,
+        )
+
+
+def test_hydrogen_rotation_is_pruned_by_heavy_atom_rmsd():
+    molecule = Molecule(atoms=[
+        Atom(element="C", x=0.0, y=1.2, z=0.0),
+        Atom(element="C", x=0.0, y=0.0, z=0.0),
+        Atom(element="C", x=1.50, y=0.0, z=0.0),
+        Atom(element="H", x=2.05, y=0.90, z=0.0),
+    ])
+    torsion = InternalDihedralCoordinate.initialize(0, 1, 2, 3, -180, 180)
+    torsion.compute(molecule)
+    ga = StandardGA(
+        molecule, logging.getLogger("test"),
+        coordinates=InternalCoordinatesList(elements=[torsion]),
+        pop_size=2, prune_rms_thresh=0.1, heavy_atom_rmsd_thresh=0.05,
+    )
+    ga.setup()
+    turned = _offset(ga.template_coords, 90.0)
+    start = ga.molecule_from_coordinates(ga.template_coords)
+    rotated = ga.molecule_from_coordinates(turned)
+    assert ga.dihedral_rmsd(ga.template_coords, turned) == pytest.approx(90.0, abs=1e-4)
+    assert ga.heavy_atom_rmsd(start, rotated) == pytest.approx(0.0, abs=1e-6)
+    kept, stats = ga._unique_conformers([
+        (1.0, ga.template_coords, "initial", 0),
+        (2.0, turned, "mutation-single", 1),
+    ])
+    assert [(origin, energy) for energy, _coords, origin, _index in kept] == [
+        ("initial", 1.0),
+    ]
+    assert stats["dropped"] == 0
+    assert stats["dropped_heavy"] == 1
+    assert stats["nearest_dropped_heavy_rmsd"] == pytest.approx(0.0, abs=1e-6)
+
+    rotated.properties["energy"] = 0.2
+    start.properties["energy"] = 1.0
+    ranked = list(ga._ranked_population([start, rotated], limit=None))
+    assert len(ranked) == 1
+    assert ranked[0].properties["energy"] == pytest.approx(0.2)
+
+    hydrogens = Molecule(atoms=[
+        Atom(element="H", x=0.0, y=0.0, z=0.0),
+        Atom(element="H", x=0.74, y=0.0, z=0.0),
+    ])
+    with pytest.raises(ValueError, match="non-hydrogen"):
+        ga.heavy_atom_rmsd(hydrogens, hydrogens)
 
 
 def test_input_minimization_failure_stops_the_search(molecule):
@@ -806,8 +861,7 @@ def test_nh2_hydrogen_swap_has_no_dihedral_rmsd():
     )
     ga.setup()
     shift = ga._dihedral_symmetries[0]
-    assert shift is not None
-    assert abs(abs(shift) - 180) < 5
+    assert shift == 180.0
     swapped = copy.deepcopy(ga.template_coords)
     angle = float(swapped.elements[0].get_actual_value(swapped.elements[0].value)) + shift
     low, high = swapped.elements[0].min_values[0], swapped.elements[0].max_values[0]
@@ -824,7 +878,75 @@ def test_nh2_hydrogen_swap_has_no_dihedral_rmsd():
     assert prune["dropped"] == 1
 
 
-def test_minimizing_ga_drops_an_optimized_conformer_with_clashing_hydrogens():
+def _search(molecule, torsion):
+    ga = StandardGA(
+        molecule, logging.getLogger("test"),
+        coordinates=InternalCoordinatesList(elements=[torsion]),
+        pop_size=2, generations=0,
+    )
+    ga.setup()
+    return ga
+
+
+def _offset(coords, degrees):
+    moved = copy.deepcopy(coords)
+    angle = float(moved.elements[0].get_actual_value(moved.elements[0].value)) + degrees
+    low, high = moved.elements[0].min_values[0], moved.elements[0].max_values[0]
+    moved.elements[0].value = (angle - low) / (high - low)
+    moved.elements[0].real_values = [angle]
+    return moved
+
+
+def test_methyl_period_is_120_and_methylene_stays_distinct():
+    methyl = Molecule(atoms=[
+        Atom(element="C", x=0.0, y=1.2, z=0.0),
+        Atom(element="C", x=0.0, y=0.0, z=0.0),
+        Atom(element="C", x=1.50, y=0.0, z=0.0),
+        Atom(element="H", x=1.86, y=1.03, z=0.0),
+        Atom(element="H", x=1.86, y=-0.51, z=0.89),
+        Atom(element="H", x=1.86, y=-0.51, z=-0.89),
+    ])
+    torsion = InternalDihedralCoordinate.initialize(0, 1, 2, 3, -180, 180)
+    torsion.compute(methyl)
+    ga = _search(methyl, torsion)
+    assert ga._dihedral_symmetries == [120.0]
+    turned = _offset(ga.template_coords, 120.0)
+    assert ga.dihedral_rmsd(ga.template_coords, turned) == pytest.approx(0.0, abs=1e-6)
+    turned = _offset(ga.template_coords, 240.0)
+    assert ga.dihedral_rmsd(ga.template_coords, turned) == pytest.approx(0.0, abs=1e-6)
+    turned = _offset(ga.template_coords, 60.0)
+    assert ga.dihedral_rmsd(ga.template_coords, turned) == pytest.approx(60.0, abs=1e-6)
+
+    methylene = Molecule(atoms=[
+        Atom(element="C", x=0.0, y=1.2, z=0.0),
+        Atom(element="C", x=0.0, y=0.0, z=0.0),
+        Atom(element="C", x=1.50, y=0.0, z=0.0),
+        Atom(element="H", x=1.90, y=0.94, z=0.30),
+        Atom(element="H", x=1.90, y=-0.70, z=0.70),
+        Atom(element="F", x=1.90, y=-0.30, z=-1.20),
+    ])
+    torsion = InternalDihedralCoordinate.initialize(0, 1, 2, 3, -180, 180)
+    torsion.compute(methylene)
+    ga = _search(methylene, torsion)
+    assert ga._dihedral_symmetries == [None]
+    turned = _offset(ga.template_coords, 180.0)
+    assert ga.dihedral_rmsd(ga.template_coords, turned) == pytest.approx(180.0, abs=1e-6)
+
+
+def test_four_identical_substituents_have_no_period():
+    crowded = Molecule(atoms=[
+        Atom(element="C", x=0.0, y=1.2, z=0.0),
+        Atom(element="C", x=0.0, y=0.0, z=0.0),
+        Atom(element="C", x=1.50, y=0.0, z=0.0),
+        Atom(element="H", x=2.20, y=0.80, z=0.40),
+        Atom(element="H", x=2.20, y=-0.80, z=0.40),
+        Atom(element="H", x=2.20, y=0.0, z=-0.90),
+        Atom(element="H", x=2.55, y=0.0, z=0.20),
+    ])
+    torsion = InternalDihedralCoordinate.initialize(0, 1, 2, 3, -180, 180)
+    torsion.compute(crowded)
+    with pytest.raises(ValueError, match="identical H substituents"):
+        _search(crowded, torsion)
     amine = Molecule(atoms=[
         Atom(element="C", x=0.0, y=0.0, z=0.0),
         Atom(element="N", x=1.45, y=0.0, z=0.0),

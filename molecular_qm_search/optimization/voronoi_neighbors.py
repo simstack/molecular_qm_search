@@ -14,9 +14,8 @@ def circular_dihedral_differences(left, right, symmetries=None):
     """Per-angle circular separation in degrees, matching ``dihedral_rmsd``.
 
     ``left`` and ``right`` broadcast over their leading axes. The last axis is
-    the dihedral. ``symmetries`` has one entry per dihedral: ``None`` for an
-    ordinary torsion, or the degree shift between indistinguishable terminal
-    hydrogens.
+    the dihedral. ``symmetries`` has one entry per dihedral: ``None`` for a
+    360 degree period, or the period of identical far-end substituents.
     """
     left = np.asarray(left, dtype=float)
     right = np.asarray(right, dtype=float)
@@ -31,21 +30,22 @@ def circular_dihedral_differences(left, right, symmetries=None):
         )
     if not np.isfinite(left).all() or not np.isfinite(right).all():
         raise ValueError("Dihedral angles must be finite")
-    difference = np.abs(left - right) % 360.0
-    difference = np.where(difference > 180.0, 360.0 - difference, difference)
     if symmetries is None:
-        return difference
-    for index, shift in enumerate(symmetries):
-        if shift is None:
-            continue
-        shift = float(shift)
-        if not np.isfinite(shift):
-            raise ValueError(f"Dihedral {index} has a non-finite symmetry shift")
-        for sign in (1.0, -1.0):
-            shifted = np.abs(left[..., index] - (right[..., index] - sign * shift)) % 360.0
-            shifted = np.where(shifted > 180.0, 360.0 - shifted, shifted)
-            difference[..., index] = np.minimum(difference[..., index], shifted)
-    return difference
+        periods = np.full(width, 360.0)
+    else:
+        periods = []
+        for index, period in enumerate(symmetries):
+            if period is None:
+                periods.append(360.0)
+                continue
+            period = float(period)
+            if not np.isfinite(period) or period <= 0:
+                raise ValueError(f"Dihedral {index} has a non-positive symmetry period")
+            periods.append(period)
+        periods = np.asarray(periods, dtype=float)
+    difference = np.abs(left - right) % periods
+    half = periods / 2.0
+    return np.where(difference > half, periods - difference, difference)
 
 
 def circular_dihedral_rmsd(left, right, symmetries=None) -> float:

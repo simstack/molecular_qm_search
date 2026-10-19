@@ -93,6 +93,16 @@ class GAConfig(Model):
             "num_confs caps the returned list of ga-min and ga-select."
         ),
     )
+    heavy_atom_rmsd_thresh: float = Field(
+        0.1,
+        title="Heavy-atom RMSD",
+        description=(
+            "Minimum heavy-atom Kabsch RMSD in angstroms between conformers that are both kept. "
+            "A higher-energy conformer is dropped when its non-hydrogen atoms superimpose "
+            "closer than this, including when the dihedral RMSD is above the dihedral prune. "
+            "This removes hydrogen rotations of an otherwise identical geometry."
+        ),
+    )
     db_treatment: DoubleBondTreatment = Field(
         DoubleBondTreatment.STEP_180,
         title="Double bond treatment",
@@ -180,6 +190,16 @@ class GAConformerParameters(Model):
             "The live population can grow back up to pop_size. "
             "The standard GA returns that population without UFF relaxation. "
             "num_confs caps the returned list of ga-min and ga-select."
+        ),
+    )
+    heavy_atom_rmsd_thresh: float = Field(
+        0.1,
+        title="Heavy-atom RMSD",
+        description=(
+            "Minimum heavy-atom Kabsch RMSD in angstroms between conformers that are both kept. "
+            "A higher-energy conformer is dropped when its non-hydrogen atoms superimpose "
+            "closer than this, including when the dihedral RMSD is above the dihedral prune. "
+            "This removes hydrogen rotations of an otherwise identical geometry."
         ),
     )
     db_treatment: DoubleBondTreatment = Field(

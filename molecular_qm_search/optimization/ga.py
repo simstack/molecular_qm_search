@@ -73,7 +73,10 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
             loop=asyncio.get_running_loop(), node_kwargs=kwargs,
         )
 
-    extra_args = {"prune_rms_thresh": config.prune_rms_thresh}
+    extra_args = {
+        "prune_rms_thresh": config.prune_rms_thresh,
+        "heavy_atom_rmsd_thresh": config.heavy_atom_rmsd_thresh,
+    }
     if config.mode == GAMode.GA_SELECT:
         extra_args["n_prune"] = config.n_prune
 

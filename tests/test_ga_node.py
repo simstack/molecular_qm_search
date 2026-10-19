@@ -63,6 +63,7 @@ async def test_node_dispatches_modes_and_returns_molecule_list(monkeypatch, mode
     if mode == "ga-select":
         assert received[0]["n_prune"] == config.n_prune
     assert received[0]["prune_rms_thresh"] == config.prune_rms_thresh
+    assert received[0]["heavy_atom_rmsd_thresh"] == config.heavy_atom_rmsd_thresh
     assert "crossover_rate" not in received[0]
 
 
@@ -92,6 +93,8 @@ def test_config_uses_method_enum_and_exposes_rotatable_bond_options():
     assert schema["properties"]["db_treatment"]["title"] == "Double bond treatment"
     assert "crossover_rate" not in schema["properties"]
     assert schema["properties"]["parallel_children"]["title"] == "Parallel children"
+    assert schema["properties"]["heavy_atom_rmsd_thresh"]["title"] == "Heavy-atom RMSD"
+    assert config.heavy_atom_rmsd_thresh == 0.1
     assert "match_double_bonds" in schema["properties"]
     assert "rotatable_bond_min" in schema["properties"]
     assert "rotatable_bond_max" in schema["properties"]

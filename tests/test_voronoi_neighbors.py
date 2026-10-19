@@ -62,7 +62,11 @@ def test_angle_pairs_match_dihedral_rmsd():
         ([0.0, 90.0], [180.0, -90.0], None),
         ([0.0], [359.0], None),
         ([0.0], [120.0], [120.0]),
-        ([15.0, 40.0], [15.0 - 115.0, 40.0], [115.0, None]),
+        ([0.0], [240.0], [120.0]),
+        ([0.0], [60.0], [120.0]),
+        ([0.0], [180.0], [180.0]),
+        ([0.0], [90.0], [180.0]),
+        ([15.0, 40.0], [15.0 + 120.0, 40.0], [120.0, None]),
     ]
     for left, right, symmetries in cases:
         measured = circular_dihedral_rmsd(left, right, symmetries)
@@ -70,6 +74,11 @@ def test_angle_pairs_match_dihedral_rmsd():
         assert measured == pytest.approx(reference)
     assert circular_dihedral_rmsd([0.0], [359.0]) == pytest.approx(1.0)
     assert circular_dihedral_rmsd([0.0], [120.0], [120.0]) == pytest.approx(0.0)
+    assert circular_dihedral_rmsd([0.0], [240.0], [120.0]) == pytest.approx(0.0)
+    assert circular_dihedral_rmsd([0.0], [60.0], [120.0]) == pytest.approx(60.0)
+    assert circular_dihedral_rmsd([0.0], [180.0], [180.0]) == pytest.approx(0.0)
+    assert circular_dihedral_rmsd([0.0], [90.0], [180.0]) == pytest.approx(90.0)
+    assert circular_dihedral_rmsd([0.0], [180.0]) == pytest.approx(180.0)
 
 
 def test_invalid_weights_gap_and_witness_count_raise():

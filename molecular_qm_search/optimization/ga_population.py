@@ -19,10 +19,10 @@ def dihedral_rmsd(
 ) -> float:
     """Circular root-mean-square difference of dihedral angles, in degrees.
 
-    ``symmetries`` has one entry per dihedral. ``None`` is an ordinary torsion.
-    A number is the angle, in degrees, between the two hydrogens of a terminal
-    group such as NH2. Those hydrogens are indistinguishable, so an angle and
-    the same angle plus or minus that shift describe one conformation.
+    ``symmetries`` has one entry per dihedral. ``None`` is a full 360 degree
+    turn. A number is the period, in degrees, of identical substituents on the
+    far atom: 180 for two (NH2) and 120 for three (CH3). The difference is the
+    shortest step on that period.
     """
     if len(left.elements) != len(right.elements):
         raise ValueError(
@@ -39,19 +39,14 @@ def dihedral_rmsd(
     for index, (first, second) in enumerate(zip(left.elements, right.elements)):
         start = float(first.get_actual_value(first.value))
         finish = float(second.get_actual_value(second.value))
-        difference = abs(start - finish) % 360
-        if difference > 180:
-            difference = 360 - difference
+        period = 360.0
         if symmetries is not None and symmetries[index] is not None:
-            if not math.isfinite(float(symmetries[index])):
-                raise ValueError(f"Dihedral {index} has a non-finite symmetry shift")
-            # The shift is not exactly 180, so the two hydrogens are not inverses
-            # of each other. Both directions map one hydrogen's angle onto the other.
-            for sign in (1.0, -1.0):
-                shifted = abs(start - (finish - sign * float(symmetries[index]))) % 360
-                if shifted > 180:
-                    shifted = 360 - shifted
-                difference = min(difference, shifted)
+            period = float(symmetries[index])
+            if not math.isfinite(period) or period <= 0:
+                raise ValueError(f"Dihedral {index} has a non-positive symmetry period")
+        difference = abs(start - finish) % period
+        if difference > period / 2.0:
+            difference = period - difference
         squares.append(difference * difference)
     return math.sqrt(sum(squares) / len(squares))
 

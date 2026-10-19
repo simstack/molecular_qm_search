@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio
-import copy
 import numpy as np
 import time
 import pickle
@@ -65,6 +64,7 @@ class BaseGA:
             mutation_rate: float = 0.2,
             dihedral_interval: float = 30.0,
             prune_rms_thresh: float = 20.0,
+            heavy_atom_rmsd_thresh: float = 0.1,
             seed: int = 1,
             max_iters: int = 500,
             parallel_children: int = 0,
@@ -87,6 +87,7 @@ class BaseGA:
         self.mutation_rate = mutation_rate
         self.dihedral_interval = dihedral_interval
         self.prune_rms_thresh = prune_rms_thresh
+        self.heavy_atom_rmsd_thresh = heavy_atom_rmsd_thresh
         self.seed = seed
         self.max_iters = max_iters
         self.parallel_children = parallel_children
@@ -124,6 +125,15 @@ class BaseGA:
             raise ValueError(
                 f"prune_rms_thresh must be a positive finite dihedral RMSD in degrees, "
                 f"got {prune_rms_thresh}"
+            )
+        if (
+            heavy_atom_rmsd_thresh is None
+            or not np.isfinite(heavy_atom_rmsd_thresh)
+            or heavy_atom_rmsd_thresh <= 0
+        ):
+            raise ValueError(
+                f"heavy_atom_rmsd_thresh must be a positive finite heavy-atom RMSD in angstroms, "
+                f"got {heavy_atom_rmsd_thresh}"
             )
         if max_iters < 0 or parallel_children < 0 or dihedral_interval < 0:
             raise ValueError("Iteration, parallel children, and dihedral-step values cannot be negative")
@@ -265,40 +275,40 @@ class BaseGA:
         self.timing["Setup"] = time.perf_counter() - t0
 
     def _set_dihedral_symmetries(self):
-        """Record the angle between equivalent terminal hydrogens on the current geometry."""
+        """Period of identical substituents bonded to the far atom of each torsion.
+
+        For A–B–C–D the far atom is C. Its substituents are the atoms bonded to
+        C other than B. Two identical substituents have period 180 degrees, as
+        in NH2. Three have period 120 degrees, as in CH3. One substituent or a
+        mixed set, such as CH2Y, keeps the full circle. Any other count of one
+        element has no defined period.
+        """
         self._dihedral_symmetries = []
+        atoms = self.initial_mol.atoms
         for coord in self.template_coords.elements:
-            atom1, atom2, atom3, atom4 = (int(index) for index in coord.atom_indices)
-            neighbors = [
-                other for other in range(len(self.initial_mol.atoms))
-                if other != atom3 and (min(atom3, other), max(atom3, other)) in self._bonded_pairs
+            _atom1, atom2, atom3, _atom4 = (int(index) for index in coord.atom_indices)
+            substituents = [
+                atoms[other].element
+                for other in range(len(atoms))
+                if other != atom2 and (min(atom3, other), max(atom3, other)) in self._bonded_pairs
             ]
-            other_hydrogens = [
-                other for other in neighbors
-                if other != atom4 and self.initial_mol.atoms[other].element == "H"
-            ]
-            terminal_pair = (
-                self.initial_mol.atoms[atom4].element == "H"
-                and len(other_hydrogens) == 1
-                and set(neighbors) == {atom2, atom4, other_hydrogens[0]}
-            )
-            if not terminal_pair:
+            if not substituents:
+                raise ValueError(
+                    f"Dihedral {tuple(coord.atom_indices)} has no substituents on atom {atom3}"
+                )
+            if len(set(substituents)) != 1 or len(substituents) == 1:
                 self._dihedral_symmetries.append(None)
                 continue
-            if not coord.real_values or not np.isfinite(float(coord.real_values[0])):
-                raise ValueError(
-                    f"Dihedral {tuple(coord.atom_indices)} has no angle on the input geometry"
-                )
-            primary = float(coord.real_values[0])
-            alternate = copy.deepcopy(coord)
-            alternate.atom_indices = [atom1, atom2, atom3, other_hydrogens[0]]
-            alternate.compute(self.initial_mol)
-            shift = (float(alternate.real_values[0]) - primary + 180.0) % 360.0 - 180.0
-            if not np.isfinite(shift) or abs(shift) < 1.0:
-                raise ValueError(
-                    f"Dihedral {tuple(coord.atom_indices)} hydrogens do not define a symmetry shift"
-                )
-            self._dihedral_symmetries.append(shift)
+            if len(substituents) == 2:
+                self._dihedral_symmetries.append(180.0)
+                continue
+            if len(substituents) == 3:
+                self._dihedral_symmetries.append(120.0)
+                continue
+            raise ValueError(
+                f"Dihedral {tuple(coord.atom_indices)} has {len(substituents)} identical "
+                f"{substituents[0]} substituents; only 2 or 3 identical substituents have a period"
+            )
 
     def _replace_search_geometry(self, molecule: Molecule) -> None:
         """Apply later dihedrals to this Cartesian structure."""
@@ -458,6 +468,60 @@ class BaseGA:
             raise ValueError("Dihedral symmetries are unavailable before setup")
         return dihedral_rmsd(ind1, ind2, self._dihedral_symmetries)
 
+    def heavy_atom_rmsd(self, left: Molecule, right: Molecule) -> float:
+        """Kabsch RMSD in angstroms of the non-hydrogen atoms, in atom order."""
+        coordinates = []
+        for molecule in (left, right):
+            if molecule is None or not molecule.atoms:
+                raise ValueError("Heavy-atom RMSD requires a molecule with atoms")
+            selected = []
+            for atom in molecule.atoms:
+                if atom.element is None or atom.element == "":
+                    raise ValueError("Heavy-atom RMSD requires an element on every atom")
+                if atom.element == "H":
+                    continue
+                position = np.array([atom.x, atom.y, atom.z], dtype=float)
+                if position.shape != (3,) or not np.all(np.isfinite(position)):
+                    raise ValueError(f"Heavy atom {atom.element} has a non-finite coordinate")
+                selected.append(position)
+            if not selected:
+                raise ValueError("Heavy-atom RMSD requires at least one non-hydrogen atom")
+            coordinates.append(np.vstack(selected))
+        reference, mobile = coordinates
+        if reference.shape != mobile.shape:
+            raise ValueError(
+                "Heavy-atom RMSD requires the same heavy-atom count, "
+                f"got {reference.shape[0]} and {mobile.shape[0]}"
+            )
+        reference = reference - reference.mean(axis=0)
+        mobile = mobile - mobile.mean(axis=0)
+        covariance = mobile.T @ reference
+        rotation_v, _, rotation_wt = np.linalg.svd(covariance)
+        determinant = float(np.linalg.det(rotation_v @ rotation_wt))
+        if not np.isfinite(determinant):
+            raise ValueError("Heavy-atom alignment is not finite")
+        sign = float(np.sign(determinant))
+        if sign == 0.0:
+            sign = 1.0
+        correction = np.diag([1.0, 1.0, sign])
+        aligned = mobile @ (rotation_v @ correction @ rotation_wt)
+        delta = aligned - reference
+        rmsd = float(np.sqrt(np.mean(np.sum(delta * delta, axis=1))))
+        if not np.isfinite(rmsd):
+            raise ValueError("Heavy-atom RMSD is not finite")
+        return rmsd
+
+    def _geometry_for_prune(self, coords: InternalCoordinatesList) -> Molecule:
+        relaxed = getattr(self, "relaxed", None)
+        if isinstance(relaxed, dict):
+            molecule = relaxed.get(id(coords))
+            if molecule is None:
+                raise ValueError(
+                    "Heavy-atom RMSD prune is missing the relaxed geometry of a conformer"
+                )
+            return molecule
+        return self.molecule_from_coordinates(coords)
+
     def _report(self, message: str) -> None:
         """Send a message to the task log and the node runner info log."""
         if hasattr(self.node_runner, "log_string"):
@@ -504,17 +568,29 @@ class BaseGA:
         kept = []
         kept_coords = []
         nearest_dropped = None
+        nearest_heavy = None
+        dropped_dihedral = 0
+        dropped_heavy = 0
         examined = 0
         for molecule in ranked:
             examined += 1
             coords = self.coordinates_from_molecule(molecule)
-            if kept_coords:
+            if kept:
                 distance = min(
                     self.dihedral_rmsd(coords, previous) for previous in kept_coords
                 )
+                heavy = min(
+                    self.heavy_atom_rmsd(molecule, previous) for previous in kept
+                )
                 if distance < self.prune_rms_thresh:
+                    dropped_dihedral += 1
                     if nearest_dropped is None or distance < nearest_dropped:
                         nearest_dropped = distance
+                    continue
+                if heavy < self.heavy_atom_rmsd_thresh:
+                    dropped_heavy += 1
+                    if nearest_heavy is None or heavy < nearest_heavy:
+                        nearest_heavy = heavy
                     continue
             kept.append(molecule)
             kept_coords.append(coords)
@@ -522,7 +598,6 @@ class BaseGA:
                 break
         if not kept:
             raise ValueError("Final population is empty")
-        dropped = examined - len(kept)
         unexamined = len(ranked) - examined
         if limit is None:
             cap_note = "num_confs cap is not applied"
@@ -533,7 +608,8 @@ class BaseGA:
             )
         self._report(
             f"Conformer prune: {len(ranked)} in, kept {len(kept)}, "
-            f"{self._dihedral_prune_phrase(dropped, nearest_dropped)}. "
+            f"{self._dihedral_prune_phrase(dropped_dihedral, nearest_dropped)}; "
+            f"{self._heavy_prune_phrase(dropped_heavy, nearest_heavy)}. "
             f"{cap_note}."
         )
         return _to_molecule_list(kept)
@@ -550,29 +626,62 @@ class BaseGA:
             f"(nearest {float(nearest):.4f} degrees)"
         )
 
+    def _heavy_prune_phrase(self, dropped: int, nearest) -> str:
+        if dropped == 0:
+            return (
+                "dropped 0 with heavy-atom RMSD below heavy_atom_rmsd_thresh "
+                f"{self.heavy_atom_rmsd_thresh}"
+            )
+        if nearest is None or not np.isfinite(nearest):
+            raise ValueError("Heavy-atom RMSD prune dropped conformers without a distance")
+        return (
+            f"dropped {dropped} with heavy-atom RMSD below heavy_atom_rmsd_thresh "
+            f"{self.heavy_atom_rmsd_thresh} (nearest {float(nearest):.4f} A)"
+        )
+
     def _unique_conformers(self, scored_pop):
-        """Keep the lowest-energy conformer of each dihedral neighborhood."""
+        """Keep the lowest-energy conformer of each dihedral and heavy-atom neighborhood."""
         kept = []
         nearest_dropped = None
+        nearest_heavy = None
+        dropped_dihedral = 0
+        dropped_heavy = 0
         for energy, coords, origin, history_index in scored_pop:
+            molecule = self._geometry_for_prune(coords)
             if kept:
                 distance = min(
-                    self.dihedral_rmsd(coords, previous) for _, previous, _, _ in kept
+                    self.dihedral_rmsd(coords, previous) for _, previous, _, _, _ in kept
+                )
+                heavy = min(
+                    self.heavy_atom_rmsd(molecule, previous_molecule)
+                    for _, _, _, _, previous_molecule in kept
                 )
                 if distance < self.prune_rms_thresh:
+                    dropped_dihedral += 1
                     if nearest_dropped is None or distance < nearest_dropped:
                         nearest_dropped = distance
                     continue
-            kept.append((energy, coords, origin, history_index))
+                if heavy < self.heavy_atom_rmsd_thresh:
+                    dropped_heavy += 1
+                    if nearest_heavy is None or heavy < nearest_heavy:
+                        nearest_heavy = heavy
+                    continue
+            kept.append((energy, coords, origin, history_index, molecule))
         if not kept:
             raise ValueError("Uniqueness filter removed every conformer")
-        dropped = len(scored_pop) - len(kept)
-        if dropped and (nearest_dropped is None or not np.isfinite(nearest_dropped)):
+        if dropped_dihedral and (nearest_dropped is None or not np.isfinite(nearest_dropped)):
             raise ValueError("Uniqueness filter dropped conformers without a dihedral RMSD")
-        return kept, {
+        if dropped_heavy and (nearest_heavy is None or not np.isfinite(nearest_heavy)):
+            raise ValueError("Uniqueness filter dropped conformers without a heavy-atom RMSD")
+        return [
+            (energy, coords, origin, history_index)
+            for energy, coords, origin, history_index, _molecule in kept
+        ], {
             "kept": len(kept),
-            "dropped": dropped,
+            "dropped": dropped_dihedral,
             "nearest_dropped_rmsd": nearest_dropped,
+            "dropped_heavy": dropped_heavy,
+            "nearest_dropped_heavy_rmsd": nearest_heavy,
         }
 
     def _select_next_population(
@@ -618,22 +727,36 @@ class BaseGA:
         unique, prune = self._unique_conformers(combined)
         kept = unique[:self.pop_size]
         nearest_pair = None
-        for index, (_, coords, _, _) in enumerate(kept):
-            for _, other, _, _ in kept[index + 1:]:
+        nearest_heavy_pair = None
+        kept_geometries = []
+        for _, coords, _, _ in kept:
+            molecule = self._geometry_for_prune(coords)
+            for other, other_molecule in kept_geometries:
                 distance = self.dihedral_rmsd(coords, other)
+                heavy = self.heavy_atom_rmsd(molecule, other_molecule)
                 if nearest_pair is None or distance < nearest_pair:
                     nearest_pair = distance
+                if nearest_heavy_pair is None or heavy < nearest_heavy_pair:
+                    nearest_heavy_pair = heavy
                 if distance < self.prune_rms_thresh:
                     raise ValueError(
                         f"Generation {gen} kept two conformers {distance:.4f} degrees apart, "
                         f"below prune_rms_thresh {self.prune_rms_thresh}"
                     )
+                if heavy < self.heavy_atom_rmsd_thresh:
+                    raise ValueError(
+                        f"Generation {gen} kept two conformers {heavy:.4f} A apart, "
+                        f"below heavy_atom_rmsd_thresh {self.heavy_atom_rmsd_thresh}"
+                    )
+            kept_geometries.append((coords, molecule))
         if nearest_pair is None:
             separation = "one conformer, so no pair to compare"
         else:
             separation = (
                 f"closest pair is {float(nearest_pair):.4f} degrees, "
-                f"at or above prune_rms_thresh {self.prune_rms_thresh}"
+                f"at or above prune_rms_thresh {self.prune_rms_thresh}; "
+                f"closest heavy-atom pair is {float(nearest_heavy_pair):.4f} A, "
+                f"at or above heavy_atom_rmsd_thresh {self.heavy_atom_rmsd_thresh}"
             )
         kept_indexes = {history_index for _, _, _, history_index in kept}
         for _, origin, _, history_index in proposed:
@@ -649,6 +772,8 @@ class BaseGA:
             f"rejected {stats['rejected_noop']} with no dihedral change; "
             f"dihedral-RMSD prune kept {prune['kept']} and "
             f"{self._dihedral_prune_phrase(prune['dropped'], prune['nearest_dropped_rmsd'])}; "
+            f"heavy-atom prune "
+            f"{self._heavy_prune_phrase(prune['dropped_heavy'], prune['nearest_dropped_heavy_rmsd'])}; "
             f"energy sort kept {len(kept)} "
             f"(current population {len(kept)}, maximum pop_size {self.pop_size}); "
             f"{separation}."
@@ -1058,13 +1183,17 @@ class BaseGA:
             self._report(f"Prune Every:    {getattr(self, 'n_prune')}")
         if hasattr(self, "prune_rms_thresh"):
             self._report(f"Prune RMS:      {getattr(self, 'prune_rms_thresh')}")
+        if hasattr(self, "heavy_atom_rmsd_thresh"):
+            self._report(f"Heavy RMSD:     {getattr(self, 'heavy_atom_rmsd_thresh')}")
         self._report(
             "Population evolution: the input geometry is minimized with the selected "
             "method before the first generation. pop_size "
             f"({self.pop_size}) is the maximum live population. Each generation proposes "
             "that many children, scores them, and keeps the lower-energy conformer when "
             "a child is within prune_rms_thresh "
-            f"({self.prune_rms_thresh} degrees dihedral RMSD) of a parent or another child. "
+            f"({self.prune_rms_thresh} degrees dihedral RMSD) of a parent or another child, "
+            "or within heavy_atom_rmsd_thresh "
+            f"({self.heavy_atom_rmsd_thresh} A heavy-atom Kabsch RMSD). "
             "Parents and surviving children are combined, sorted by energy, and cut at "
             "pop_size. The live population can grow back up to pop_size; the maximum does "
             "not shrink. The standard GA returns every conformer that survived the last "
