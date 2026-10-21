@@ -84,6 +84,7 @@ async def test_node_returns_molecules_and_requires_the_neighbor_graph(monkeypatc
             asyncio.get_running_loop()
         kwargs["node_runner"].energy_chart = object()
         kwargs["node_runner"].energy_histogram = object()
+        kwargs["node_runner"].accepted_histogram = object()
         kwargs["node_runner"].operator_stats = object()
         kwargs["node_runner"].neighbor_graph = object()
         return ranked
@@ -100,6 +101,7 @@ async def test_node_returns_molecules_and_requires_the_neighbor_graph(monkeypatc
     def generate_without_graph(**kwargs):
         kwargs["node_runner"].energy_chart = object()
         kwargs["node_runner"].energy_histogram = object()
+        kwargs["node_runner"].accepted_histogram = object()
         kwargs["node_runner"].operator_stats = object()
         return ranked
 

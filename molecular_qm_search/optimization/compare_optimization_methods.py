@@ -1,5 +1,6 @@
 import inspect
 import logging
+import math
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 class ConformerRelaxationMethod(str, Enum):
     """List calculator used to relax the generated conformers."""
 
+    OFF = "off"
     XTB = "xtb"
     DFTB = "dftb"
 
@@ -113,7 +115,7 @@ class CompareConformers(Model):
         },
     )
     comparison_count: int = Field(
-        default=3, description="Number of relaxed conformers to compare"
+        default=3, description="Number of conformers to compare"
     )
     rmsd_threshold: float = Field(
         default=0.5, description="RMSD threshold for matching conformers (Angstrom)"
@@ -122,7 +124,7 @@ class CompareConformers(Model):
         ConformerRelaxationMethod.DFTB,
         json_schema_extra={
             "title": "Final relaxation",
-            "description": "Relax generated conformers with the xTB or DFTB list calculator",
+            "description": "Relax generated conformers with xTB or DFTB, or select off to use existing energies",
         },
     )
     xtb_parameters: Optional[XTBListCalculatorParameters] = Field(
@@ -165,10 +167,13 @@ class CompareConformers(Model):
                 try:
                     method = ConformerRelaxationMethod(method)
                 except ValueError as exc:
-                    raise ValueError("relaxation_method must be xtb or dftb") from exc
-            if method not in (ConformerRelaxationMethod.XTB, ConformerRelaxationMethod.DFTB):
-                raise ValueError("relaxation_method must be xtb or dftb")
-        if method == ConformerRelaxationMethod.XTB:
+                    raise ValueError("relaxation_method must be off, xtb or dftb") from exc
+            if method not in tuple(ConformerRelaxationMethod):
+                raise ValueError("relaxation_method must be off, xtb or dftb")
+        if method == ConformerRelaxationMethod.OFF:
+            data["xtb_parameters"] = None
+            data["dftb_parameters"] = None
+        elif method == ConformerRelaxationMethod.XTB:
             data["dftb_parameters"] = None
         else:
             data["xtb_parameters"] = None
@@ -199,8 +204,8 @@ class CompareConformers(Model):
                 )
             if not self.dftb_parameters.optimization:
                 raise ValueError("DFTB optimization must be enabled to relax conformers")
-        else:
-            raise ValueError("relaxation_method must be xtb or dftb")
+        elif self.relaxation_method != ConformerRelaxationMethod.OFF:
+            raise ValueError("relaxation_method must be off, xtb or dftb")
         return self
 
     @classmethod
@@ -294,6 +299,11 @@ class CompareConformers(Model):
             "oneOf": [
                 {
                     "properties": {
+                        "relaxation_method": {"const": ConformerRelaxationMethod.OFF.value},
+                    },
+                },
+                {
+                    "properties": {
                         "relaxation_method": {"const": ConformerRelaxationMethod.XTB.value},
                         "xtb_parameters": xtb_schema,
                     },
@@ -338,8 +348,31 @@ async def _relax_conformers(
 ) -> List[Tuple[Molecule, float]]:
     """
     Relax each conformer with the selected list calculator.
-    Returns a list of (relaxed_molecule, energy_hartree) sorted by energy ascending.
+    With off, use existing energies without changing conformer geometries.
+    Returns (molecule, energy) pairs sorted by energy ascending.
     """
+    if opts.relaxation_method == ConformerRelaxationMethod.OFF:
+        ranked = []
+        for index, molecule in enumerate(conformers, start=1):
+            raw_energy = molecule.properties.get("energy")
+            try:
+                energy = float(raw_energy)
+                if isinstance(raw_energy, bool) or not math.isfinite(energy):
+                    raise ValueError("energy must be finite and numeric")
+            except (TypeError, ValueError, OverflowError):
+                message = (
+                    f"Skipping conformer {index}: missing or invalid existing energy "
+                    "with final relaxation off."
+                )
+                logger.warning(message)
+                node_runner = kwargs.get("node_runner")
+                if node_runner is not None:
+                    node_runner.warning(message)
+                continue
+            ranked.append((molecule, energy))
+        ranked.sort(key=lambda item: item[1])
+        return ranked
+
     if opts.relaxation_method == ConformerRelaxationMethod.XTB:
         from molecular_qm_psi4.models.crest_input import XTBInput
         from molecular_qm_psi4.nodes.crest import xtb_optimize_molecule_list
@@ -382,7 +415,7 @@ async def _relax_conformers(
         return relaxed_list
 
     if opts.relaxation_method != ConformerRelaxationMethod.DFTB:
-        raise ValueError("relaxation_method must be xtb or dftb")
+        raise ValueError("relaxation_method must be off, xtb or dftb")
     if opts.dftb_parameters is None:
         raise ValueError(
             "DFTB list calculator parameters are required when DFTB relaxation is selected"
@@ -457,8 +490,8 @@ async def compare_optimization_methods(
 ) -> MoleculeList:
     """
     Compare up to 4 conformer generators (GA, OpenBabel, RDKit, CREST),
-    relax the generated conformers with either the xTB or DFTB list calculator,
-    compute an NxN aligned RMSD matrix between lowest relaxed conformers, and
+    optionally relax generated conformers with the xTB or DFTB list calculator,
+    compare the lowest-energy conformers by aligned RMSD, and
     prepare a SimpleTable of conformer ranks.
 
     The genetic algorithm runs ``run_ga_conformer_gen``. Its parameters are
@@ -468,7 +501,8 @@ async def compare_optimization_methods(
 
     ``relaxation_method`` selects the final relaxation. xTB exposes
     ``xtb_parameters`` for ``xtb_optimize_molecule_list``. DFTB exposes
-    ``dftb_parameters`` for ``dftb_list_calculator``.
+    ``dftb_parameters`` for ``dftb_list_calculator``. Off skips both calculators
+    and ranks using existing energies as supplied, without unit conversion.
 
     Called Nodes:
         run_ga_conformer_gen
@@ -580,7 +614,11 @@ async def compare_optimization_methods(
     relaxed_by_method: Dict[str, List[Tuple[Molecule, float]]] = {}
     for method_label, confs in generated_by_method.items():
         if len(confs) > 0:
-            if node_runner is not None:
+            if node_runner is not None and opts.relaxation_method == ConformerRelaxationMethod.OFF:
+                node_runner.info(
+                    f"Skipping final relaxation for {method_label}; using existing energies."
+                )
+            elif node_runner is not None:
                 node_runner.info(
                     f"Relaxing {len(confs)} conformers for {method_label} "
                     f"with {opts.relaxation_method.value}..."
@@ -593,7 +631,7 @@ async def compare_optimization_methods(
     active_methods = [m[0] for m in methods_to_run if len(relaxed_by_method.get(m[0], [])) > 0]
     if not active_methods:
         if node_runner is not None:
-            node_runner.warning("No conformers generated or relaxed successfully.")
+            node_runner.warning("No conformers with usable energies available after final relaxation selection.")
         return MoleculeList()
 
     # 3. Sort all conformers by energy and consider the list up to 2xcomparison_count

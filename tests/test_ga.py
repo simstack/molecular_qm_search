@@ -256,10 +256,25 @@ def test_run_returns_conformers_chart_table_and_task_log(molecule, coordinates, 
     assert "Dihedral Types:" in runner.log_string
     assert runner.log_string == "\n".join(runner.info_messages) + "\n"
     chart = runner.energy_chart
-    assert [series.yKey for series in chart.series] == ["min-energy", "max-energy"]
-    assert [series.title for series in chart.series] == ["min-energy", "max-energy"]
+    assert [series.yKey for series in chart.series] == [
+        "min-energy", "rank-1/4", "rank-2/4", "rank-3/4", "rank-4/4", "max-energy",
+    ]
+    assert [series.title for series in chart.series] == [
+        "min-energy", "rank 1/4", "rank 2/4", "rank 3/4", "rank 4/4", "max-energy",
+    ]
     assert [row["iteration"] for row in chart.data] == [0, 1, 2]
-    assert all("min-energy" in row and "max-energy" in row for row in chart.data)
+    assert all(
+        row["min-energy"] <= row["rank-1/4"] <= row["rank-2/4"]
+        <= row["rank-3/4"] <= row["rank-4/4"] <= row["max-energy"]
+        for row in chart.data
+    )
+    accepted = runner.accepted_histogram
+    assert accepted.title.text == "Newly accepted conformers"
+    assert [series.yKey for series in accepted.series] == ["accepted"]
+    assert [row["iteration"] for row in accepted.data] == [0, 1, 2]
+    assert accepted.data[0]["accepted"] >= 1
+    assert all(row["accepted"] >= 0 for row in accepted.data)
+    assert sum(row["accepted"] for row in accepted.data) >= len(runner.conformation_energies.row)
     table = runner.operator_stats
     assert table.heading == ["change", "produced", "elite_survivors", "success_rate"]
     changes = [row["change"] for row in table.row]
@@ -363,6 +378,22 @@ def test_diversity_chart_separates_distinct_dihedrals(molecule, coordinates):
     assert collapsed[1]["pc1"] == pytest.approx(0.0)
 
 
+def test_rank_quarters_follow_the_sorted_population(molecule, coordinates):
+    ga = StandardGA(molecule, logging.getLogger("test"), coordinates=coordinates, pop_size=1)
+    ga._record_energy_iteration(0, [4.0, 1.0, 3.0, 2.0, 5.0])
+    point = ga.energy_history[0]
+    assert point["min_energy"] == 1.0
+    assert point["max_energy"] == 5.0
+    assert point["rank-1/4"] == 2.0
+    assert point["rank-2/4"] == 3.0
+    assert point["rank-3/4"] == 4.0
+    assert point["rank-4/4"] == 5.0
+    ga._record_accepted_iteration(0, [0])
+    ga._record_accepted_iteration(1, [0, 1, 2])
+    ga._record_accepted_iteration(2, [2])
+    assert [row["accepted"] for row in ga.accepted_history] == [1, 2, 0]
+
+
 def test_energy_plot_drops_iterations_until_range_settles(molecule, coordinates):
     runner = RecordingRunner()
     ga = StandardGA(
@@ -372,7 +403,15 @@ def test_energy_plot_drops_iterations_until_range_settles(molecule, coordinates)
     # 7 -> 0.4 would drop everything before the last two; the plot still keeps 10.
     spans = [200.0, 180.0, 8.0] + [7.0] * 7 + [0.4, 0.4]
     ga.energy_history = [
-        {"iteration": index, "min_energy": 0.0, "max_energy": span}
+        {
+            "iteration": index,
+            "min_energy": 0.0,
+            "max_energy": span,
+            "rank-1/4": span / 4,
+            "rank-2/4": span / 2,
+            "rank-3/4": 3 * span / 4,
+            "rank-4/4": span,
+        }
         for index, span in enumerate(spans)
     ]
     ga._publish_energy_chart()

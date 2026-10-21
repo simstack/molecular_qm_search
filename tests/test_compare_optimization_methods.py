@@ -408,3 +408,97 @@ async def test_relaxation_calls_the_selected_list_calculator(monkeypatch):
     assert xtb_input.additional_keywords == "--gfn 1"
     assert xtb_input.level_of_theory.method is CrestLevelOfTheoryEnum.GFN2_XTB
     assert len(xtb_input.molecules) == 1
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_off_schema_and_validation(stale):
+    schema = CompareConformers.json_schema()
+    arms = {
+        arm["properties"]["relaxation_method"]["const"]: arm
+        for arm in schema["dependencies"]["relaxation_method"]["oneOf"]
+    }
+    assert set(arms) == {"off", "xtb", "dftb"}
+    assert set(arms["off"]["properties"]) == {"relaxation_method"}
+    assert not arms["off"].get("required")
+    assert schema["properties"]["relaxation_method"]["default"] == "dftb"
+    params = {}
+    if stale:
+        # Inactive settings must be cleared before nested validation.
+        params = {
+            "xtb_parameters": {"optimize": "invalid"},
+            "dftb_parameters": {"optimization": "invalid"},
+        }
+    opts = CompareConformers(
+        use_ga=False, molecule=_carbon(), relaxation_method="off", **params
+    )
+    assert opts.relaxation_method is ConformerRelaxationMethod.OFF
+    assert opts.xtb_parameters is None
+    assert opts.dftb_parameters is None
+    restored = CompareConformers.model_validate(opts.model_dump())
+    assert restored.relaxation_method is ConformerRelaxationMethod.OFF
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("all_invalid", [False, True])
+async def test_off_uses_existing_energies_without_calculators(monkeypatch, all_invalid):
+    def conformers(energies):
+        result = MoleculeList()
+        for index, energy in enumerate(energies):
+            mol = _carbon()
+            mol.atoms[0].x = float(index + 1)
+            if energy is not None:
+                mol.properties["energy"] = energy
+            result.append(mol)
+        return result
+
+    bad = [None, "bad", float("nan"), float("inf"), -float("inf"), True]
+    babel = conformers(bad if all_invalid else [-1.0, -3.0, *bad])
+    rdkit = conformers([] if all_invalid else [-2.0])
+    before = [
+        [(atom.x, atom.y, atom.z) for atom in mol.atoms]
+        for mol in [*babel, *rdkit]
+    ]
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("off must not invoke a final-relaxation calculator")
+
+    import molecular_qm_dftb.nodes.dftb_list_calculator  # noqa: F401
+    monkeypatch.setattr(
+        sys.modules["molecular_qm_dftb.nodes.dftb_list_calculator"],
+        "dftb_list_calculator", forbidden,
+    )
+    monkeypatch.setattr(
+        "molecular_qm_psi4.nodes.crest.xtb_optimize_molecule_list", forbidden,
+    )
+    monkeypatch.setattr(
+        "molecular_qm_util.obabel_scripts.openbabel_conformers.conformers_openbabel",
+        lambda *args, **kwargs: babel,
+    )
+    monkeypatch.setattr(
+        "molecular_qm_util.rdkit_scripts.rdkit_conformers.conformers_rdkit",
+        lambda *args, **kwargs: rdkit,
+    )
+    warnings = []
+    runner = _runner()
+    runner.warning = warnings.append
+    opts = CompareConformers(
+        use_ga=False, use_rdkit=True, molecule=_carbon(),
+        relaxation_method="off", comparison_count=1,
+    )
+    result = await compare_optimization_methods.__wrapped__(opts, node_runner=runner)
+    assert len([w for w in warnings if "invalid existing energy" in w]) == len(bad)
+    assert before == [
+        [(atom.x, atom.y, atom.z) for atom in mol.atoms]
+        for mol in [*babel, *rdkit]
+    ]
+    if all_invalid:
+        assert len(result) == 0
+        assert any("No conformers" in w for w in warnings)
+    else:
+        assert [mol.properties["energy"] for mol in result] == [-3.0, -2.0]
+        assert [mol.properties["rank_id"] for mol in result] == [1, 2]
+        assert [mol.properties["method"] for mol in result] == ["Babel", "RDKit"]
+        assert runner.comparison_table is runner.table
+        assert len(runner.table.row) == 2
+        assert runner.table.row[0]["RDKit"] == "1/0.0"
+        assert runner.table.row[1]["Babel"] == "1/0.0"

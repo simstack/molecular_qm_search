@@ -111,6 +111,8 @@ class BaseGA:
         self.rotatable_bond_max = rotatable_bond_max
         self.timing: Dict[str, float] = {}
         self.energy_history: List[Dict[str, float]] = []
+        self.accepted_history: List[Dict[str, int]] = []
+        self._accepted_ids: set[int] = set()
         self._energy_plot_start: Optional[int] = None
         self.artifact_loop = artifact_loop
         # [kept after selection, produced] for each population-change label.
@@ -200,6 +202,8 @@ class BaseGA:
             "success_stats": self.success_stats,
             "counted_history": sorted(self._counted_history),
             "energy_history": self.energy_history,
+            "accepted_history": self.accepted_history,
+            "accepted_ids": sorted(self._accepted_ids),
             "best_energy_seen": self.best_energy_seen,
             "random_state": self.population_generator.random.getstate(),
             "history": self._history,
@@ -229,6 +233,10 @@ class BaseGA:
             self.population_generator.random.setstate(state["random_state"])
         if "energy_history" not in state:
             raise ValueError("GA checkpoint has no energy_history")
+        if "accepted_history" not in state or not isinstance(state["accepted_history"], list):
+            raise ValueError("GA checkpoint has no accepted-conformer history")
+        if "accepted_ids" not in state or not isinstance(state["accepted_ids"], list):
+            raise ValueError("GA checkpoint has no accepted conformer indexes")
         if "success_stats" not in state:
             raise ValueError("GA checkpoint has no success_stats")
         if "counted_history" not in state or not isinstance(state["counted_history"], list):
@@ -249,6 +257,25 @@ class BaseGA:
         self.success_stats = state["success_stats"]
         self._counted_history = set(state["counted_history"])
         self.energy_history = state["energy_history"]
+        accepted_ids = []
+        for history_index in state["accepted_ids"]:
+            if isinstance(history_index, bool) or not isinstance(history_index, int):
+                raise ValueError(
+                    f"GA checkpoint has no integer accepted conformer index, got {history_index!r}"
+                )
+            accepted_ids.append(history_index)
+        for point in state["accepted_history"]:
+            if (
+                not isinstance(point, dict)
+                or "iteration" not in point
+                or "accepted" not in point
+                or isinstance(point["accepted"], bool)
+                or not isinstance(point["accepted"], int)
+                or point["accepted"] < 0
+            ):
+                raise ValueError(f"GA checkpoint accepted-conformer history is incomplete: {point}")
+        self.accepted_history = state["accepted_history"]
+        self._accepted_ids = set(accepted_ids)
         self.best_energy_seen = state.get("best_energy_seen", float('inf'))
         if hasattr(self, "rmsd_history") and "rmsd_history" in state:
             self.rmsd_history = state["rmsd_history"]
@@ -577,10 +604,40 @@ class BaseGA:
     def _record_energy_iteration(self, iteration: int, energies: List[float]) -> None:
         if not energies:
             raise ValueError(f"GA iteration {iteration} produced no energies")
-        self.energy_history.append({
+        ordered = sorted(float(energy) for energy in energies)
+        if any(not np.isfinite(energy) for energy in ordered):
+            raise ValueError(f"GA iteration {iteration} has a non-finite energy")
+        count = len(ordered)
+        point = {
             "iteration": int(iteration),
-            "min_energy": float(min(energies)),
-            "max_energy": float(max(energies)),
+            "min_energy": ordered[0],
+            "max_energy": ordered[-1],
+        }
+        for quarter in range(1, 5):
+            index = (quarter * count + 3) // 4 - 1
+            if index < 0 or index >= count:
+                raise ValueError(
+                    f"GA iteration {iteration} cannot place rank quarter {quarter} in a population of {count}"
+                )
+            point[f"rank-{quarter}/4"] = ordered[index]
+        self.energy_history.append(point)
+
+    def _record_accepted_iteration(self, iteration: int, history_indexes: List[int]) -> None:
+        if len(history_indexes) != len(set(history_indexes)):
+            raise ValueError(f"Iteration {iteration} repeats a conformer history index")
+        newly_accepted = 0
+        for history_index in history_indexes:
+            if isinstance(history_index, bool) or not isinstance(history_index, int):
+                raise ValueError(
+                    f"Iteration {iteration} has no integer history index, got {history_index!r}"
+                )
+            if history_index in self._accepted_ids:
+                continue
+            self._accepted_ids.add(history_index)
+            newly_accepted += 1
+        self.accepted_history.append({
+            "iteration": int(iteration),
+            "accepted": newly_accepted,
         })
 
     def _ranked_population(self, molecules: List[Molecule], *, limit: Optional[int]) -> MoleculeList:
@@ -845,14 +902,20 @@ class BaseGA:
             )
         self._energy_plot_start = start
         plotted_history = self.energy_history[start:]
-        data = [
-            {
+        rank_strokes = ("#2E86AB", "#7B68EE", "#F4A261", "#E76F51")
+        data = []
+        for point in plotted_history:
+            row = {
                 "iteration": int(point["iteration"]),
                 "min-energy": float(point["min_energy"]),
                 "max-energy": float(point["max_energy"]),
             }
-            for point in plotted_history
-        ]
+            for quarter in range(1, 5):
+                key = f"rank-{quarter}/4"
+                if key not in point or not np.isfinite(point[key]):
+                    raise ValueError(f"Iteration {point['iteration']} has no {key} energy")
+                row[key] = float(point[key])
+            data.append(row)
         series = [
             AGLineSeriesConfig(
                 type="line",
@@ -862,6 +925,17 @@ class BaseGA:
                 data=data,
                 stroke="#4ECDC4",
             ),
+            *[
+                AGLineSeriesConfig(
+                    type="line",
+                    xKey="iteration",
+                    yKey=f"rank-{quarter}/4",
+                    title=f"rank {quarter}/4",
+                    data=data,
+                    stroke=rank_strokes[quarter - 1],
+                )
+                for quarter in range(1, 5)
+            ],
             AGLineSeriesConfig(
                 type="line",
                 xKey="iteration",
@@ -888,6 +962,48 @@ class BaseGA:
             legend=AGChartLegendConfig(enabled=True, position="right"),
         )
         self._attach_conformation_table(self.node_runner.energy_chart)
+
+    def _publish_accepted_histogram(self) -> None:
+        if not self.accepted_history:
+            raise ValueError("GA produced no accepted-conformer history")
+        bins = []
+        for point in self.accepted_history:
+            if "iteration" not in point or "accepted" not in point:
+                raise ValueError(f"Accepted-conformer history is incomplete: {point}")
+            accepted = point["accepted"]
+            if isinstance(accepted, bool) or not isinstance(accepted, int) or accepted < 0:
+                raise ValueError(
+                    f"Iteration {point['iteration']} has no accepted-conformer count, got {accepted!r}"
+                )
+            bins.append({
+                "iteration": int(point["iteration"]),
+                "accepted": accepted,
+            })
+        series = [
+            AGColumnSeriesConfig(
+                type="column",
+                xKey="iteration",
+                yKey="accepted",
+                title="accepted",
+                data=bins,
+                fill="#2A9D8F",
+            )
+        ]
+        chart = getattr(self.node_runner, "accepted_histogram", None)
+        if isinstance(chart, ChartArtifactModel):
+            chart.data = bins
+            chart.series = series
+            return
+        self.node_runner.accepted_histogram = ChartArtifactModel(
+            data=bins,
+            title=AGChartTitleConfig(text="Newly accepted conformers"),
+            series=series,
+            axes=[
+                AGChartAxisConfig(type="number", position="bottom", title="iteration"),
+                AGChartAxisConfig(type="number", position="left", title="accepted"),
+            ],
+            legend=AGChartLegendConfig(enabled=False),
+        )
 
     def _publish_energy_histogram(self, energies: List[float]) -> None:
         if not energies:
@@ -1102,7 +1218,10 @@ class BaseGA:
             raise RuntimeError("Publish GA artifacts from the worker thread, not the event loop")
         parent_id = task_id if isinstance(task_id, ObjectId) else ObjectId(str(task_id))
         charts = []
-        for name in ("energy_chart", "energy_histogram", "diversity_chart", *self._dihedral_histogram_names):
+        for name in (
+            "energy_chart", "energy_histogram", "accepted_histogram", "diversity_chart",
+            *self._dihedral_histogram_names,
+        ):
             chart = getattr(self.node_runner, name, None)
             if chart is None:
                 continue
@@ -1119,6 +1238,7 @@ class BaseGA:
 
     def _publish_run_report(self, molecules: List[Molecule]) -> None:
         self._publish_energy_chart()
+        self._publish_accepted_histogram()
         if not self._conformation_rows:
             raise ValueError("GA produced no conformation energies")
         self._publish_energy_histogram([
@@ -1295,6 +1415,7 @@ class BaseGA:
                 }
             ]
             self._record_energy_iteration(0, [mol.properties["energy"] for mol in evaluated])
+            self._record_accepted_iteration(0, [0])
             molecules = self._ranked_population(evaluated, limit=self.num_confs)
             self._publish_run_report(list(molecules))
             return molecules
@@ -1361,15 +1482,19 @@ class BaseGA:
             ]
             population = self.selection(scored_with_labels, gen)
             energies = []
+            history_indexes = []
             scored_coords = []
-            for coords, _, energy, _ in population:
+            for coords, _, energy, history_index in population:
                 if energy is None or not np.isfinite(energy):
                     raise ValueError("Population conformer has no finite energy")
                 energies.append(energy)
+                history_indexes.append(history_index)
                 scored_coords.append(coords)
             self._remember_conformation_energies(population)
             self._record_energy_iteration(gen, energies)
+            self._record_accepted_iteration(gen, history_indexes)
             self._publish_energy_chart()
+            self._publish_accepted_histogram()
             self._publish_energy_histogram(energies)
             self._publish_diversity_chart(scored_coords)
             self._publish_dihedral_histograms(scored_coords)

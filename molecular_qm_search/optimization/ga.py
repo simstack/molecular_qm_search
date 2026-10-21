@@ -35,8 +35,9 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
 
     SimstackResult:
         molecules (MoleculeList): Population that survived the last selection, lowest single-point energy first. The input geometry is minimized with the selected method before the search. The standard GA does not relax the returned geometries.
-        energy_chart (ChartArtifactModel): Minimum and maximum population energy versus iteration, updated every iteration
+        energy_chart (ChartArtifactModel): Minimum and maximum population energy versus iteration, plus the energy at the end of each quarter of the population ranked by energy, updated every iteration
         energy_histogram (ChartArtifactModel): Histogram of the population energies, updated every iteration
+        accepted_histogram (ChartArtifactModel): Count of conformers accepted into the population for the first time versus iteration, updated every iteration
         diversity_chart (ChartArtifactModel): PCA of pairwise dihedral RMSD, updated every iteration when the population has at least two conformers
         dihedral_histogram_0, dihedral_histogram_1, ... (ChartArtifactModel): Count of conformers in 30 degree bins for each rotatable dihedral, updated every iteration and again from the returned molecules
         operator_stats (SimpleTable): Fraction of new conformers of each change type that selection kept
@@ -108,6 +109,8 @@ async def run_ga_conformer_gen(config: GAConfig, **kwargs) -> SimstackResult:
         raise ValueError("GA did not produce an energy chart")
     if getattr(node_runner, "energy_histogram", None) is None:
         raise ValueError("GA did not produce an energy histogram")
+    if getattr(node_runner, "accepted_histogram", None) is None:
+        raise ValueError("GA did not produce an accepted-conformer histogram")
     if getattr(node_runner, "operator_stats", None) is None:
         raise ValueError("GA did not produce operator statistics")
     node_runner.molecules = ranked
