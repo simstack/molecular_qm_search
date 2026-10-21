@@ -816,6 +816,104 @@ def test_high_force_field_gradient_is_repeated_twice_then_discarded(molecule, mo
     assert result[0].properties["force_field_gradient"] > 1e-4
 
 
+def _scripted_force_field(molecule, energies, gradients, calls):
+    class FakeField:
+        def __init__(self):
+            self.step = 0
+
+        def Initialize(self):
+            return None
+
+        def Minimize(self, maxIts, forceTol, energyTol):
+            calls["minimize"] += 1
+            self.step += 1
+            if self.step > len(energies):
+                raise AssertionError("minimization continued after the scripted steps")
+
+        def CalcEnergy(self):
+            return energies[self.step - 1]
+
+        def CalcGrad(self):
+            value = gradients[self.step - 1]
+            return (value, 0.0, 0.0) * len(molecule.atoms)
+
+    return FakeField
+
+
+def test_initial_relaxation_stops_when_energy_or_gradient_stops_falling(molecule, monkeypatch):
+    calls = {"minimize": 0}
+    field = _scripted_force_field(molecule, [100.0, 90.0, 95.0], [50.0, 40.0, 55.0], calls)
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFHasAllMoleculeParams", lambda rdkit_mol: True)
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFGetMoleculeForceField", lambda rdkit_mol: field())
+    evaluator = RDKitEvaluator(forcefield="uff")
+    evaluator.bind_connectivity(molecule)
+    result = evaluator.optimize(
+        [molecule], max_iters=20, attempts=10, require_improvement=True,
+    )[0]
+    assert calls["minimize"] == 3
+    assert result.properties["energy"] == 90.0
+    assert result.properties["force_field_discarded"] is True
+    assert result.properties["force_field_attempts"] == 3
+    assert result.properties["optimization_converged"] is False
+
+
+def test_initial_relaxation_repeats_ten_times_while_both_decrease(molecule, monkeypatch):
+    calls = {"minimize": 0}
+    field = _scripted_force_field(
+        molecule,
+        [float(100 - step) for step in range(10)],
+        [float(50 - step) for step in range(10)],
+        calls,
+    )
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFHasAllMoleculeParams", lambda rdkit_mol: True)
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFGetMoleculeForceField", lambda rdkit_mol: field())
+    evaluator = RDKitEvaluator(forcefield="uff")
+    evaluator.bind_connectivity(molecule)
+    result = evaluator.optimize(
+        [molecule], max_iters=20, attempts=10, require_improvement=True,
+    )[0]
+    assert calls["minimize"] == 10
+    assert result.properties["energy"] == 91.0
+    assert result.properties["force_field_discarded"] is True
+    assert result.properties["force_field_attempts"] == 10
+
+
+def test_initial_relaxation_stops_once_the_gradient_is_small(molecule, monkeypatch):
+    calls = {"minimize": 0}
+    field = _scripted_force_field(molecule, [100.0, 80.0, 60.0, 40.0], [50.0, 30.0, 10.0, 0.0], calls)
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFHasAllMoleculeParams", lambda rdkit_mol: True)
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFGetMoleculeForceField", lambda rdkit_mol: field())
+    evaluator = RDKitEvaluator(forcefield="uff")
+    evaluator.bind_connectivity(molecule)
+    result = evaluator.optimize(
+        [molecule], max_iters=20, attempts=10, require_improvement=True,
+    )[0]
+    assert calls["minimize"] == 4
+    assert result.properties["energy"] == 40.0
+    assert result.properties.get("force_field_discarded") is not True
+    assert result.properties["force_field_attempts"] == 4
+    assert result.properties["optimization_converged"] is True
+
+
+def test_initial_relaxation_requests_ten_improving_attempts(molecule, coordinates, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    class AwareEvaluator(Evaluator):
+        def optimize(self, molecules, *, max_iters, attempts=3, require_improvement=False):
+            self.calls.append((
+                "optimize", len(molecules), max_iters, attempts, require_improvement,
+            ))
+            return super().optimize(molecules, max_iters=max_iters)
+
+    evaluator = AwareEvaluator()
+    ga = StandardGA(
+        molecule, logging.getLogger("test"), evaluator=evaluator, coordinates=coordinates,
+        pop_size=1, generations=0,
+    )
+    ga.run()
+    assert evaluator.calls[0] == ("optimize", 1, 500, 10, True)
+
+
 def test_low_force_field_gradient_stops_without_a_repeat(molecule, monkeypatch):
     calls = {"minimize": 0}
 

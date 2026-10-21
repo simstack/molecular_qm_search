@@ -83,9 +83,24 @@ class RDKitEvaluator(BaseModel):
             from molecular_qm_util import evaluate_molecules_rdkit
 
             return evaluate_molecules_rdkit(molecules, self.forcefield, threads=self.threads)
-        return self._evaluate_on_connectivity(molecules, optimize=False, max_iters=500)
+        return self._evaluate_on_connectivity(
+            molecules, optimize=False, max_iters=500, attempts=1, require_improvement=False,
+        )
 
-    def optimize(self, molecules: list[Molecule], *, max_iters: int) -> list[Molecule]:
+    def optimize(
+            self,
+            molecules: list[Molecule],
+            *,
+            max_iters: int,
+            attempts: int = 3,
+            require_improvement: bool = False,
+    ) -> list[Molecule]:
+        if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+            raise ValueError(f"attempts must be a positive integer, got {attempts!r}")
+        if not isinstance(require_improvement, bool):
+            raise ValueError(
+                f"require_improvement must be a bool, got {require_improvement!r}"
+            )
         if self._connectivity is None:
             from molecular_qm_util import evaluate_molecules_rdkit
 
@@ -96,7 +111,13 @@ class RDKitEvaluator(BaseModel):
                 max_iters=max_iters,
                 threads=self.threads,
             )
-        return self._evaluate_on_connectivity(molecules, optimize=True, max_iters=max_iters)
+        return self._evaluate_on_connectivity(
+            molecules,
+            optimize=True,
+            max_iters=max_iters,
+            attempts=attempts,
+            require_improvement=require_improvement,
+        )
 
     def _template(self):
         if self._bond_template is None:
@@ -105,7 +126,9 @@ class RDKitEvaluator(BaseModel):
             self._bond_template = molecule_to_rdkit(self._connectivity)
         return self._bond_template
 
-    def _evaluate_on_connectivity(self, molecules, *, optimize: bool, max_iters: int):
+    def _evaluate_on_connectivity(
+            self, molecules, *, optimize: bool, max_iters: int, attempts: int, require_improvement: bool,
+    ):
         import os
         from concurrent.futures import ThreadPoolExecutor
 
@@ -160,9 +183,23 @@ class RDKitEvaluator(BaseModel):
             force_tol = 1e-4
             discarded = False
             gradient_test = None
+            accepted_energy = None
             if optimize:
-                for _attempt in range(3):
+                previous_energy = None
+                previous_norm = None
+                previous_gradient_test = None
+                performed = 0
+                for _attempt in range(attempts):
+                    saved_positions = [
+                        Point3D(
+                            conformer.GetAtomPosition(index).x,
+                            conformer.GetAtomPosition(index).y,
+                            conformer.GetAtomPosition(index).z,
+                        )
+                        for index in range(conformer.GetNumAtoms())
+                    ]
                     force_field.Minimize(maxIts=int(max_iters), forceTol=force_tol, energyTol=1e-6)
+                    performed += 1
                     raw_gradient = tuple(force_field.CalcGrad())
                     if any(not math.isfinite(component) for component in raw_gradient):
                         raise ValueError("Force-field gradient is not finite")
@@ -171,6 +208,9 @@ class RDKitEvaluator(BaseModel):
                             f"Force field returned {len(raw_gradient)} gradient components "
                             f"for {conformer.GetNumAtoms()} atoms"
                         )
+                    gradient_norm = math.sqrt(sum(component * component for component in raw_gradient))
+                    if not math.isfinite(gradient_norm):
+                        raise ValueError("Force-field gradient norm is not finite")
                     scaled = [component * 0.1 for component in raw_gradient]
                     max_component = max(abs(component) for component in scaled)
                     grad_scale = 0.1
@@ -192,16 +232,34 @@ class RDKitEvaluator(BaseModel):
                     gradient_test /= term
                     if not math.isfinite(gradient_test):
                         raise ValueError("Force-field gradient is not finite")
+                    if (
+                        require_improvement
+                        and previous_energy is not None
+                        and (energy >= previous_energy or gradient_norm >= previous_norm)
+                    ):
+                        for index, position in enumerate(saved_positions):
+                            conformer.SetAtomPosition(index, position)
+                        energy = previous_energy
+                        gradient_test = previous_gradient_test
+                        discarded = gradient_test >= force_tol
+                        break
+                    accepted_energy = energy
                     if gradient_test < force_tol:
                         break
+                    previous_energy = energy
+                    previous_norm = gradient_norm
+                    previous_gradient_test = gradient_test
                 else:
                     discarded = True
+                if performed < 1 or accepted_energy is None:
+                    raise ValueError("Force-field optimization finished without an accepted step")
             result = Molecule.from_molecule(molecule)
             result.properties = copy.deepcopy(molecule.properties)
             result.properties.pop("rank_id", None)
             result.properties.pop("optimization_converged", None)
             result.properties.pop("force_field_discarded", None)
             result.properties.pop("force_field_gradient", None)
+            result.properties.pop("force_field_attempts", None)
             if optimize:
                 for index, atom in enumerate(result.atoms):
                     position = conformer.GetAtomPosition(index)
@@ -212,8 +270,11 @@ class RDKitEvaluator(BaseModel):
                         raise ValueError("Force-field optimization stopped without a gradient")
                     result.properties["force_field_discarded"] = True
                     result.properties["force_field_gradient"] = float(gradient_test)
+                if require_improvement:
+                    result.properties["force_field_attempts"] = performed
+            reported_energy = accepted_energy if optimize else float(force_field.CalcEnergy())
             result.properties.update(
-                energy=float(force_field.CalcEnergy()),
+                energy=float(reported_energy),
                 energy_unit="kcal/mol",
                 method=f"rdkit+{name}",
             )

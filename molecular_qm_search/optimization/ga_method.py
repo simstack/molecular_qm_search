@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import inspect
 import numpy as np
 import time
 import pickle
@@ -161,14 +162,32 @@ class BaseGA:
     def coordinates_from_molecule(self, mol: Molecule) -> InternalCoordinatesList:
         return self.population_generator.coordinates_from_molecule(mol)
 
-    def evaluate_molecules(self, molecules: List[Molecule], *, optimize=False,
-                           max_iters=None) -> List[Molecule]:
+    def evaluate_molecules(
+            self,
+            molecules: List[Molecule],
+            *,
+            optimize=False,
+            max_iters=None,
+            attempts=None,
+            require_improvement=False,
+    ) -> List[Molecule]:
         if not molecules:
             return []
         if optimize:
-            results = self.evaluator.optimize(
-                molecules, max_iters=self.max_iters if max_iters is None else max_iters
-            )
+            limit = self.max_iters if max_iters is None else max_iters
+            kwargs = {"max_iters": limit}
+            if attempts is not None:
+                if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+                    raise ValueError(f"attempts must be a positive integer, got {attempts!r}")
+                if not isinstance(require_improvement, bool):
+                    raise ValueError(
+                        f"require_improvement must be a bool, got {require_improvement!r}"
+                    )
+                parameters = inspect.signature(self.evaluator.optimize).parameters
+                if "attempts" in parameters and "require_improvement" in parameters:
+                    kwargs["attempts"] = attempts
+                    kwargs["require_improvement"] = require_improvement
+            results = self.evaluator.optimize(molecules, **kwargs)
         else:
             results = self.evaluator.score(molecules)
         return validate_results(molecules, results)
@@ -534,9 +553,18 @@ class BaseGA:
         gradient = molecule.properties.get("force_field_gradient")
         if gradient is None or not np.isfinite(float(gradient)):
             raise ValueError("Discarded conformer has no force-field gradient")
+        attempts = molecule.properties.get("force_field_attempts")
+        if attempts is None:
+            repeat = "after two repeated optimizations"
+        else:
+            if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+                raise ValueError(
+                    f"Discarded conformer has no usable optimization count, got {attempts!r}"
+                )
+            repeat = f"after {attempts} optimizations"
         self._report(
             "Discarded conformer because the force-field gradient stayed high "
-            f"({float(gradient):.6g}) after two repeated optimizations."
+            f"({float(gradient):.6g}) {repeat}."
         )
         return True
 
@@ -1146,7 +1174,9 @@ class BaseGA:
         self.setup()
         loaded = self.load_state() if self.restart else None
         if loaded is None:
-            minimized = self.evaluate_molecules([self.initial_mol], optimize=True)
+            minimized = self.evaluate_molecules(
+                [self.initial_mol], optimize=True, attempts=10, require_improvement=True,
+            )
             if len(minimized) != 1:
                 raise ValueError(
                     f"Minimization of the input geometry returned {len(minimized)} molecules"
@@ -1157,10 +1187,20 @@ class BaseGA:
                     "Minimization of the input geometry left a high force-field gradient"
                 )
             self._replace_search_geometry(molecule)
+            performed = molecule.properties.get("force_field_attempts")
+            if performed is None:
+                relaxation = ""
+            else:
+                if isinstance(performed, bool) or not isinstance(performed, int) or performed < 1:
+                    raise ValueError(
+                        f"Initial relaxation has no usable optimization count, got {performed!r}"
+                    )
+                relaxation = f" in {performed} force-field optimizations"
             self._report(
                 "Minimized the input geometry with "
                 f"{type(self.evaluator).__name__} to "
-                f"{float(molecule.properties['energy']):.6g} kcal/mol before the search."
+                f"{float(molecule.properties['energy']):.6g} kcal/mol{relaxation} "
+                "before the search."
             )
         self._report("\n--- GA Parameters ---")
         self._report(f"Atoms:          {len(self.initial_mol.atoms)}")
@@ -1203,8 +1243,9 @@ class BaseGA:
             "one well collapse there. ga-select also drops conformers above "
             "min energy + 0.1*|min energy| before breeding. "
             "When a force-field minimization stops with a gradient above its force "
-            "tolerance, it is repeated twice, and the conformer is discarded if the "
-            "gradient is still high."
+            "tolerance, a population conformer is repeated twice and discarded if the "
+            "gradient is still high. The initial geometry is repeated up to 10 times "
+            "while its energy and gradient norm both decrease."
         )
         self._report(f"Rotatable Bonds: {len(self.template_coords.elements)}")
         self._report(f"Dihedrals:       {self.dihedrals}")
