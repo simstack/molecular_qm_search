@@ -1182,6 +1182,16 @@ class BaseGA:
                     f"Minimization of the input geometry returned {len(minimized)} molecules"
                 )
             molecule = minimized[0]
+            progress = molecule.properties.get("force_field_progress")
+            if progress is not None:
+                if not isinstance(progress, str) or not progress.strip():
+                    raise ValueError(
+                        f"Initial relaxation has no usable progress log, got {progress!r}"
+                    )
+                for line in progress.splitlines():
+                    if not line.strip():
+                        raise ValueError("Initial relaxation progress has an empty line")
+                    self._report(line)
             if self._force_field_discarded(molecule):
                 raise ValueError(
                     "Minimization of the input geometry left a high force-field gradient"
@@ -1244,8 +1254,9 @@ class BaseGA:
             "min energy + 0.1*|min energy| before breeding. "
             "When a force-field minimization stops with a gradient above its force "
             "tolerance, a population conformer is repeated twice and discarded if the "
-            "gradient is still high. The initial geometry is repeated up to 10 times "
-            "while its energy and gradient norm both decrease."
+            "gradient is still high. The initial geometry is minimized 10 times. "
+            "Each attempt logs its energy and gradient norm, and the search stops "
+            "afterward if the force tolerance is still missed."
         )
         self._report(f"Rotatable Bonds: {len(self.template_coords.elements)}")
         self._report(f"Dihedrals:       {self.dihedrals}")

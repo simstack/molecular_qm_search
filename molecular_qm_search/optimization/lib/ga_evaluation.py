@@ -184,21 +184,25 @@ class RDKitEvaluator(BaseModel):
             discarded = False
             gradient_test = None
             accepted_energy = None
+            progress_rows = []
             if optimize:
-                previous_energy = None
-                previous_norm = None
-                previous_gradient_test = None
                 performed = 0
+                minimize_force_tol = force_tol
+                rdkit_converged = False
+                met = False
                 for _attempt in range(attempts):
-                    saved_positions = [
-                        Point3D(
-                            conformer.GetAtomPosition(index).x,
-                            conformer.GetAtomPosition(index).y,
-                            conformer.GetAtomPosition(index).z,
-                        )
-                        for index in range(conformer.GetNumAtoms())
-                    ]
-                    force_field.Minimize(maxIts=int(max_iters), forceTol=force_tol, energyTol=1e-6)
+                    if require_improvement and rdkit_converged:
+                        minimize_force_tol = minimize_force_tol / 10.0
+                        if not math.isfinite(minimize_force_tol) or minimize_force_tol <= 0:
+                            raise ValueError(
+                                "Force tolerance became "
+                                f"{minimize_force_tol} while repeating the initial relaxation"
+                            )
+                        force_field.Initialize()
+                        rdkit_converged = False
+                    status = force_field.Minimize(
+                        maxIts=int(max_iters), forceTol=minimize_force_tol, energyTol=1e-6,
+                    )
                     performed += 1
                     raw_gradient = tuple(force_field.CalcGrad())
                     if any(not math.isfinite(component) for component in raw_gradient):
@@ -232,25 +236,23 @@ class RDKitEvaluator(BaseModel):
                     gradient_test /= term
                     if not math.isfinite(gradient_test):
                         raise ValueError("Force-field gradient is not finite")
+                    accepted_energy = energy
+                    if require_improvement:
+                        progress_rows.append(
+                            f"Initial relaxation {performed}/{attempts}: "
+                            f"energy {energy:.6g} kcal/mol, gradient norm {gradient_norm:.6g}"
+                        )
+                    if gradient_test < force_tol:
+                        met = True
+                        break
                     if (
                         require_improvement
-                        and previous_energy is not None
-                        and (energy >= previous_energy or gradient_norm >= previous_norm)
+                        and isinstance(status, int)
+                        and not isinstance(status, bool)
+                        and status == 0
                     ):
-                        for index, position in enumerate(saved_positions):
-                            conformer.SetAtomPosition(index, position)
-                        energy = previous_energy
-                        gradient_test = previous_gradient_test
-                        discarded = gradient_test >= force_tol
-                        break
-                    accepted_energy = energy
-                    if gradient_test < force_tol:
-                        break
-                    previous_energy = energy
-                    previous_norm = gradient_norm
-                    previous_gradient_test = gradient_test
-                else:
-                    discarded = True
+                        rdkit_converged = True
+                discarded = not met
                 if performed < 1 or accepted_energy is None:
                     raise ValueError("Force-field optimization finished without an accepted step")
             result = Molecule.from_molecule(molecule)
@@ -260,6 +262,7 @@ class RDKitEvaluator(BaseModel):
             result.properties.pop("force_field_discarded", None)
             result.properties.pop("force_field_gradient", None)
             result.properties.pop("force_field_attempts", None)
+            result.properties.pop("force_field_progress", None)
             if optimize:
                 for index, atom in enumerate(result.atoms):
                     position = conformer.GetAtomPosition(index)
@@ -272,6 +275,9 @@ class RDKitEvaluator(BaseModel):
                     result.properties["force_field_gradient"] = float(gradient_test)
                 if require_improvement:
                     result.properties["force_field_attempts"] = performed
+                    if not progress_rows:
+                        raise ValueError("Initial relaxation finished without a progress record")
+                    result.properties["force_field_progress"] = "\n".join(progress_rows)
             reported_energy = accepted_energy if optimize else float(force_field.CalcEnergy())
             result.properties.update(
                 energy=float(reported_energy),

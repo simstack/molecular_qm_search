@@ -816,19 +816,23 @@ def test_high_force_field_gradient_is_repeated_twice_then_discarded(molecule, mo
     assert result[0].properties["force_field_gradient"] > 1e-4
 
 
-def _scripted_force_field(molecule, energies, gradients, calls):
+def _scripted_force_field(molecule, energies, gradients, calls, tols=None, status=None):
     class FakeField:
         def __init__(self):
             self.step = 0
 
         def Initialize(self):
+            calls["initialize"] = calls.get("initialize", 0) + 1
             return None
 
         def Minimize(self, maxIts, forceTol, energyTol):
             calls["minimize"] += 1
+            if tols is not None:
+                tols.append(forceTol)
             self.step += 1
             if self.step > len(energies):
                 raise AssertionError("minimization continued after the scripted steps")
+            return status
 
         def CalcEnergy(self):
             return energies[self.step - 1]
@@ -840,9 +844,11 @@ def _scripted_force_field(molecule, energies, gradients, calls):
     return FakeField
 
 
-def test_initial_relaxation_stops_when_energy_or_gradient_stops_falling(molecule, monkeypatch):
+def test_initial_relaxation_runs_ten_times_before_rejecting_a_high_gradient(molecule, monkeypatch):
     calls = {"minimize": 0}
-    field = _scripted_force_field(molecule, [100.0, 90.0, 95.0], [50.0, 40.0, 55.0], calls)
+    energies = [100.0, 90.0, 95.0] + [94.0] * 7
+    gradients = [50.0, 40.0, 55.0] + [50.0] * 7
+    field = _scripted_force_field(molecule, energies, gradients, calls)
     monkeypatch.setattr("rdkit.Chem.AllChem.UFFHasAllMoleculeParams", lambda rdkit_mol: True)
     monkeypatch.setattr("rdkit.Chem.AllChem.UFFGetMoleculeForceField", lambda rdkit_mol: field())
     evaluator = RDKitEvaluator(forcefield="uff")
@@ -850,11 +856,16 @@ def test_initial_relaxation_stops_when_energy_or_gradient_stops_falling(molecule
     result = evaluator.optimize(
         [molecule], max_iters=20, attempts=10, require_improvement=True,
     )[0]
-    assert calls["minimize"] == 3
-    assert result.properties["energy"] == 90.0
+    lines = result.properties["force_field_progress"].splitlines()
+    assert calls["minimize"] == 10
+    assert result.properties["energy"] == 94.0
     assert result.properties["force_field_discarded"] is True
-    assert result.properties["force_field_attempts"] == 3
+    assert result.properties["force_field_attempts"] == 10
     assert result.properties["optimization_converged"] is False
+    assert len(lines) == 10
+    assert lines[0].startswith("Initial relaxation 1/10: energy 100 kcal/mol, gradient norm ")
+    assert lines[2].startswith("Initial relaxation 3/10: energy 95 kcal/mol, gradient norm ")
+    assert lines[9].startswith("Initial relaxation 10/10: energy 94 kcal/mol, gradient norm ")
 
 
 def test_initial_relaxation_repeats_ten_times_while_both_decrease(molecule, monkeypatch):
@@ -876,6 +887,47 @@ def test_initial_relaxation_repeats_ten_times_while_both_decrease(molecule, monk
     assert result.properties["energy"] == 91.0
     assert result.properties["force_field_discarded"] is True
     assert result.properties["force_field_attempts"] == 10
+    assert "energy 100 kcal/mol, gradient norm " in result.properties["force_field_progress"]
+    assert "energy 91 kcal/mol, gradient norm " in result.properties["force_field_progress"]
+
+
+def test_stalled_initial_step_retries_with_a_tighter_force_tolerance(molecule, monkeypatch):
+    calls = {"minimize": 0}
+    tols = []
+    field = _scripted_force_field(
+        molecule, [100.0, 100.0, 70.0], [50.0, 50.0, 0.0], calls, tols=tols,
+    )
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFHasAllMoleculeParams", lambda rdkit_mol: True)
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFGetMoleculeForceField", lambda rdkit_mol: field())
+    evaluator = RDKitEvaluator(forcefield="uff")
+    evaluator.bind_connectivity(molecule)
+    result = evaluator.optimize(
+        [molecule], max_iters=20, attempts=10, require_improvement=True,
+    )[0]
+    assert calls["minimize"] == 3
+    assert tols == [1e-4, 1e-4, 1e-4]
+    assert result.properties["energy"] == 70.0
+    assert result.properties.get("force_field_discarded") is not True
+    assert "energy 100 kcal/mol, gradient norm " in result.properties["force_field_progress"]
+    assert "energy 70 kcal/mol, gradient norm " in result.properties["force_field_progress"]
+
+
+def test_rdkit_convergence_tightens_the_next_initial_attempt(molecule, monkeypatch):
+    calls = {"minimize": 0}
+    tols = []
+    field = _scripted_force_field(
+        molecule, [100.0, 90.0, 80.0], [50.0, 40.0, 0.0], calls, tols=tols, status=0,
+    )
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFHasAllMoleculeParams", lambda rdkit_mol: True)
+    monkeypatch.setattr("rdkit.Chem.AllChem.UFFGetMoleculeForceField", lambda rdkit_mol: field())
+    evaluator = RDKitEvaluator(forcefield="uff")
+    evaluator.bind_connectivity(molecule)
+    result = evaluator.optimize(
+        [molecule], max_iters=20, attempts=10, require_improvement=True,
+    )[0]
+    assert tols == pytest.approx([1e-4, 1e-5, 1e-6])
+    assert result.properties["energy"] == 80.0
+    assert result.properties.get("force_field_discarded") is not True
 
 
 def test_initial_relaxation_stops_once_the_gradient_is_small(molecule, monkeypatch):
@@ -912,6 +964,36 @@ def test_initial_relaxation_requests_ten_improving_attempts(molecule, coordinate
     )
     ga.run()
     assert evaluator.calls[0] == ("optimize", 1, 500, 10, True)
+
+
+def test_initial_relaxation_logs_each_energy_and_gradient_norm(molecule, coordinates):
+    runner = RecordingRunner()
+
+    class LoggingEvaluator(Evaluator):
+        def optimize(self, molecules, *, max_iters, attempts=3, require_improvement=False):
+            result = Molecule.from_molecule(molecules[0])
+            result.properties.update(
+                energy=12.5,
+                energy_unit="kcal/mol",
+                force_field_discarded=True,
+                force_field_gradient=0.000839301,
+                force_field_attempts=attempts,
+                force_field_progress=(
+                    "Initial relaxation 1/10: energy 20 kcal/mol, gradient norm 1.5\n"
+                    "Initial relaxation 10/10: energy 12.5 kcal/mol, gradient norm 0.4"
+                ),
+            )
+            return [result]
+
+    ga = StandardGA(
+        molecule, runner, evaluator=LoggingEvaluator(), coordinates=coordinates,
+        pop_size=1, generations=0,
+    )
+    with pytest.raises(ValueError, match="high force-field gradient"):
+        ga.run()
+    assert "Initial relaxation 1/10: energy 20 kcal/mol, gradient norm 1.5" in runner.log_string
+    assert "Initial relaxation 10/10: energy 12.5 kcal/mol, gradient norm 0.4" in runner.log_string
+    assert "after 10 optimizations" in runner.log_string
 
 
 def test_low_force_field_gradient_stops_without_a_repeat(molecule, monkeypatch):
