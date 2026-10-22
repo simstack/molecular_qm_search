@@ -31,11 +31,13 @@ def _dftb(**overrides):
 
 
 def _runner():
-    return SimpleNamespace(
+    runner = SimpleNamespace(
         info=lambda *args, **kwargs: None,
         warning=lambda *args, **kwargs: None,
         fail=lambda *args, **kwargs: None,
     )
+    runner.succeed = lambda: runner.molecule_list
+    return runner
 
 
 def test_ga_conformer_parameters_match_ga_config_except_molecule():
@@ -537,8 +539,19 @@ async def test_complete_ranking_and_distinct_low_energy_coverage(monkeypatch):
     async def empty_crest(*args, **kwargs):
         return SimpleNamespace(molecule_list=MoleculeList())
     monkeypatch.setattr("molecular_qm_psi4.nodes.crest.crest", empty_crest)
-    runner = _runner()
-    result = await compare_optimization_methods.__wrapped__(opts, node_runner=runner)
+    from simstack.core.node_runner import NodeRunner
+    from simstack.core.definitions import TaskStatus
+    from simstack.models.simple_table import SimpleTable
+
+    runner = NodeRunner(name="compare_optimization_methods", task_id="test")
+    monkeypatch.setattr(NodeRunner, "_make_log_file", lambda self: None)
+    returned = await compare_optimization_methods.__wrapped__(opts, node_runner=runner)
+    assert returned is runner
+    assert returned.status == TaskStatus.COMPLETED
+    assert isinstance(returned.comparison_table, SimpleTable)
+    assert isinstance(returned.method_success_table, SimpleTable)
+    assert returned.comparison_table is returned.table
+    result = returned.molecule_list
     assert len(result) == len(runner.table.row) == 105
     assert [mol.properties["energy"] for mol in result] == sorted(m.properties["energy"] for m in [*babel, *rdkit])
     assert runner.table.row[2]["Method"] == "RDKit"

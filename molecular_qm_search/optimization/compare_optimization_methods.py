@@ -2,7 +2,7 @@ import inspect
 import logging
 import math
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from odmantic import Field, Model
 from pydantic import model_validator
@@ -12,6 +12,7 @@ from molecular_qm_models import Molecule, MoleculeList
 from molecular_qm_psi4.models.crest_input import CrestInput, CrestLevelOfTheory
 from molecular_qm_search.optimization.models.ga_models import GAConformerParameters
 from simstack.core.node import node
+from simstack.core.simstack_result import SimstackResult
 from simstack.models import simstack_model
 from simstack.models.simple_table import SimpleTable, SimpleTableColumnType
 from simstack.util.cleaned_json_schema import cleaned_json_schema
@@ -488,7 +489,7 @@ async def _relax_conformers(
 async def compare_optimization_methods(
     opts: CompareConformers,
     **kwargs,
-) -> MoleculeList:
+) -> Union[MoleculeList, SimstackResult]:
     """
     Compare up to 4 conformer generators (GA, OpenBabel, RDKit, CREST),
     optionally relax generated conformers with the xTB or DFTB list calculator,
@@ -780,5 +781,8 @@ async def compare_optimization_methods(
                 "Final relaxation is off: pooled energy ranks and method success are meaningful "
                 "only if all supplied energies use the same units and level of theory."
             )
+        # Returning only the molecule list discards the runner's attached tables
+        # from persisted results and from subsequent artifact recomputation.
+        return node_runner.succeed()
 
     return best_conformers
