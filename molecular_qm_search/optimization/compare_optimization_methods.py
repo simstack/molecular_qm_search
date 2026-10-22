@@ -115,10 +115,11 @@ class CompareConformers(Model):
         },
     )
     comparison_count: int = Field(
-        default=3, description="Number of conformers to compare"
+        default=3, ge=1,
+        description="Number of lowest-energy distinct conformers used to assess method success; all configurations are returned",
     )
     rmsd_threshold: float = Field(
-        default=0.5, description="RMSD threshold for matching conformers (Angstrom)"
+        default=0.5, ge=0, description="RMSD threshold for matching conformers (Angstrom)"
     )
     relaxation_method: ConformerRelaxationMethod = Field(
         ConformerRelaxationMethod.DFTB,
@@ -491,8 +492,10 @@ async def compare_optimization_methods(
     """
     Compare up to 4 conformer generators (GA, OpenBabel, RDKit, CREST),
     optionally relax generated conformers with the xTB or DFTB list calculator,
-    compare the lowest-energy conformers by aligned RMSD, and
-    prepare a SimpleTable of conformer ranks.
+    return every configuration with a usable energy in ascending energy order,
+    and prepare ranking and low-energy method-success SimpleTables.
+    ``comparison_count`` controls the number of RMSD-distinct low-energy
+    references used for method coverage, without limiting the returned list.
 
     The genetic algorithm runs ``run_ga_conformer_gen``. Its parameters are
     ``ga_config`` and are used only when the genetic algorithm is selected.
@@ -634,7 +637,7 @@ async def compare_optimization_methods(
             node_runner.warning("No conformers with usable energies available after final relaxation selection.")
         return MoleculeList()
 
-    # 3. Sort all conformers by energy and consider the list up to 2xcomparison_count
+    # 3. Rank every usable configuration; comparison_count never truncates output.
     all_conformers: List[Dict[str, object]] = []
     for method_label in active_methods:
         for rank_in_method, (mol, energy) in enumerate(relaxed_by_method[method_label], start=1):
@@ -648,21 +651,57 @@ async def compare_optimization_methods(
             )
 
     all_conformers.sort(key=lambda x: x["energy"])
-    top_limit = 2 * opts.comparison_count
-    top_conformers = all_conformers[:top_limit]
+    top_conformers = all_conformers
 
     # 4. Prepare SimpleTable comparing each conformer with conformers from each method
     comparison_table = SimpleTable(name="Conformer Comparison Table")
-    comparison_table.add_column("Conformer", SimpleTableColumnType.NUMBER)
+    comparison_table.add_column("Total rank", SimpleTableColumnType.NUMBER)
+    for column, kind in (
+        ("Method", SimpleTableColumnType.STRING),
+        ("Method rank", SimpleTableColumnType.NUMBER),
+        ("Energy", SimpleTableColumnType.NUMBER),
+        ("Relative energy", SimpleTableColumnType.NUMBER),
+    ):
+        comparison_table.add_column(column, kind)
     for m in active_methods:
         comparison_table.add_column(m, SimpleTableColumnType.STRING)
 
+    # Cache pairwise alignments, also used for distinct low-energy references.
+    rmsd_cache = {}
+
+    def rmsd_between(left, right):
+        if left is right:
+            return 0.0
+        key = tuple(sorted((id(left), id(right))))
+        if key not in rmsd_cache:
+            try:
+                _, _, rmsd = align_molecules(left, right)
+                rmsd_cache[key] = float(rmsd) if math.isfinite(rmsd) else float("inf")
+            except Exception as exc:
+                logger.warning(f"Alignment failed between conformers: {exc}")
+                rmsd_cache[key] = float("inf")
+        return rmsd_cache[key]
+
+    references = []
+    coverage = {method: set() for method, _ in methods_to_run}
     for conf_idx, item in enumerate(top_conformers, start=1):
         target_mol = item["molecule"]
         target_method = item["method"]
         target_rank = item["rank_in_method"]
 
-        row_data: Dict[str, object] = {"Conformer": conf_idx}
+        row_data: Dict[str, object] = {
+            "Total rank": conf_idx,
+            "Method": target_method,
+            "Method rank": target_rank,
+            "Energy": item["energy"],
+            "Relative energy": item["energy"] - all_conformers[0]["energy"],
+        }
+        is_reference = (
+            len(references) < opts.comparison_count
+            and all(rmsd_between(target_mol, ref) > opts.rmsd_threshold for ref in references)
+        )
+        if is_reference:
+            references.append(target_mol)
 
         for m in active_methods:
             if m == target_method:
@@ -673,32 +712,73 @@ async def compare_optimization_methods(
                 best_rank = None
 
                 for k, (cand_mol, _) in enumerate(method_conformers, start=1):
-                    try:
-                        _, _, rmsd = align_molecules(target_mol, cand_mol)
-                        if rmsd < best_rmsd:
-                            best_rmsd = rmsd
-                            best_rank = k
-                    except Exception as exc:
-                        logger.warning(f"Alignment failed between conformers: {exc}")
+                    rmsd = rmsd_between(target_mol, cand_mol)
+                    if rmsd < best_rmsd:
+                        best_rmsd = rmsd
+                        best_rank = k
 
                 if best_rank is not None and best_rmsd <= opts.rmsd_threshold:
                     row_data[m] = f"{best_rank}/{round(best_rmsd, 4)}"
                 else:
                     row_data[m] = "NA/NA"
 
+            if is_reference and row_data[m] != "NA/NA":
+                coverage[m].add(len(references))
+
         comparison_table.add_row(row_data)
 
     best_conformers = MoleculeList()
     for global_rank, item in enumerate(top_conformers, start=1):
-        mol = item["molecule"]
+        mol = item["molecule"].model_copy(deep=True)
         mol.properties["rank_id"] = global_rank
         mol.properties["method"] = item["method"]
+        mol.properties["rank_in_method"] = item["rank_in_method"]
         best_conformers.append(mol)
+
+    success_table = SimpleTable(name="Low-energy conformer discovery by method")
+    for column, kind in (
+        ("Method", SimpleTableColumnType.STRING),
+        ("Generated", SimpleTableColumnType.NUMBER),
+        ("Ranked", SimpleTableColumnType.NUMBER),
+        ("Unranked", SimpleTableColumnType.NUMBER),
+        ("Best total rank", SimpleTableColumnType.NUMBER),
+        ("Best energy", SimpleTableColumnType.NUMBER),
+        ("Low-energy conformers found", SimpleTableColumnType.NUMBER),
+        ("Low-energy reference count", SimpleTableColumnType.NUMBER),
+        ("Coverage (%)", SimpleTableColumnType.NUMBER),
+        ("Finds global minimum", SimpleTableColumnType.STRING),
+    ):
+        success_table.add_column(column, kind)
+    for method, _ in sorted(methods_to_run, key=lambda method: -len(coverage[method[0]])):
+        ranked = relaxed_by_method[method]
+        success_table.add_row({
+            "Method": method,
+            "Generated": len(generated_by_method[method]),
+            "Ranked": len(ranked),
+            "Unranked": len(generated_by_method[method]) - len(ranked),
+            "Best total rank": next((i for i, item in enumerate(all_conformers, 1) if item["method"] == method), None),
+            "Best energy": ranked[0][1] if ranked else None,
+            "Low-energy conformers found": len(coverage[method]),
+            "Low-energy reference count": len(references),
+            "Coverage (%)": 100.0 * len(coverage[method]) / len(references),
+            "Finds global minimum": "Yes" if 1 in coverage[method] else "No",
+        })
 
     if node_runner is not None:
         node_runner.table = comparison_table
         node_runner.comparison_table = comparison_table
+        node_runner.method_success_table = success_table
         node_runner.molecule_list = best_conformers
-        node_runner.info(f"Compare conformers finished with {len(best_conformers)} best conformers.")
+        node_runner.info(
+            f"Ranked all {len(best_conformers)} usable configurations. Method columns show "
+            "closest matching method rank/RMSD (Angstrom), or NA/NA. Success is coverage "
+            f"of the {len(references)} lowest-energy RMSD-distinct pooled conformers; "
+            "methods with equal coverage are tied. Energy and relative energy use the calculator's units."
+        )
+        if opts.relaxation_method == ConformerRelaxationMethod.OFF:
+            node_runner.warning(
+                "Final relaxation is off: pooled energy ranks and method success are meaningful "
+                "only if all supplied energies use the same units and level of theory."
+            )
 
     return best_conformers

@@ -495,10 +495,60 @@ async def test_off_uses_existing_energies_without_calculators(monkeypatch, all_i
         assert len(result) == 0
         assert any("No conformers" in w for w in warnings)
     else:
-        assert [mol.properties["energy"] for mol in result] == [-3.0, -2.0]
-        assert [mol.properties["rank_id"] for mol in result] == [1, 2]
-        assert [mol.properties["method"] for mol in result] == ["Babel", "RDKit"]
+        assert [mol.properties["energy"] for mol in result] == [-3.0, -2.0, -1.0]
+        assert [mol.properties["rank_id"] for mol in result] == [1, 2, 3]
+        assert [mol.properties["method"] for mol in result] == ["Babel", "RDKit", "Babel"]
         assert runner.comparison_table is runner.table
-        assert len(runner.table.row) == 2
+        assert len(runner.table.row) == 3
         assert runner.table.row[0]["RDKit"] == "1/0.0"
         assert runner.table.row[1]["Babel"] == "1/0.0"
+
+
+@pytest.mark.asyncio
+async def test_complete_ranking_and_distinct_low_energy_coverage(monkeypatch):
+    def ensemble(values):
+        result = MoleculeList()
+        for shape, energy in values:
+            mol = _carbon()
+            mol.properties.update(energy=energy, shape=shape)
+            result.append(mol)
+        return result
+
+    # Repeated low-energy structures must not crowd out the second reference.
+    babel = ensemble([(0, -10.0), (0, -9.9), (1, -9.0), *[(2, float(i)) for i in range(100)]])
+    rdkit = ensemble([(0, -9.8), (2, -8.0)])
+    monkeypatch.setattr(
+        "molecular_qm_util.obabel_scripts.openbabel_conformers.conformers_openbabel",
+        lambda *args, **kwargs: babel,
+    )
+    monkeypatch.setattr(
+        "molecular_qm_util.rdkit_scripts.rdkit_conformers.conformers_rdkit",
+        lambda *args, **kwargs: rdkit,
+    )
+    monkeypatch.setattr(
+        "molecular_qm_models.align_molecules.align_molecules",
+        lambda left, right: (None, None, abs(left.properties["shape"] - right.properties["shape"])),
+    )
+    opts = CompareConformers(
+        use_ga=False, use_rdkit=True, use_crest=True,
+        crest_input=CrestInput(molecule=_carbon()),
+        relaxation_method="off", comparison_count=2,
+    )
+    async def empty_crest(*args, **kwargs):
+        return SimpleNamespace(molecule_list=MoleculeList())
+    monkeypatch.setattr("molecular_qm_psi4.nodes.crest.crest", empty_crest)
+    runner = _runner()
+    result = await compare_optimization_methods.__wrapped__(opts, node_runner=runner)
+    assert len(result) == len(runner.table.row) == 105
+    assert [mol.properties["energy"] for mol in result] == sorted(m.properties["energy"] for m in [*babel, *rdkit])
+    assert runner.table.row[2]["Method"] == "RDKit"
+    assert runner.table.row[2]["Method rank"] == 1
+    assert runner.table.row[2]["Relative energy"] == pytest.approx(0.2)
+    assert runner.table.row[3]["RDKit"] == "NA/NA"
+    by_method = {row["Method"]: row for row in runner.method_success_table.row}
+    assert by_method["Babel"]["Coverage (%)"] == 100.0
+    assert by_method["RDKit"]["Coverage (%)"] == 50.0
+    assert by_method["RDKit"]["Finds global minimum"] == "Yes"
+    assert by_method["CREST"]["Ranked"] == 0
+    assert by_method["CREST"]["Coverage (%)"] == 0.0
+    assert all(row["Low-energy reference count"] == 2 for row in by_method.values())
