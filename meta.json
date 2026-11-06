@@ -1,0 +1,17 @@
+{
+  "title": "Molecular QM Search",
+  "workflow_environment": "SimStack",
+  "description": "SimStack nodes for molecular conformer generation and optimization, including genetic-algorithm and Voronoi-based searches.",
+  "authors": [
+    "Wolfgang Wenzel",
+    "Phillip Dullinger"
+  ],
+  "release": "v0.1.0",
+  "keywords": [
+    "SimStack",
+    "molecular quantum mechanics",
+    "conformer search",
+    "geometry optimization",
+    "genetic algorithm"
+  ]
+}
