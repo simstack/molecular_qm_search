@@ -6,7 +6,8 @@ readme = "README.md"
 requires-python = ">=3.12, <3.13"
 license = { text = "MIT" }
 authors = [
-  { name = "Wolfgang Wenzel", email = "wolfgang.wenzel@kit.edu" }
+  { name = "Wolfgang Wenzel", email = "wolfgang.wenzel@kit.edu" },
+  { name = "Phillip Dullinger", email = "phillip.dullinger@kit.edu" }
 ]
 dependencies = [
     "molecular_qm_models",
