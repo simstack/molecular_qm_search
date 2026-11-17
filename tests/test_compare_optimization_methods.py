@@ -8,6 +8,7 @@ from molecular_qm_dftb.models.dftb_input import DftbInput
 from molecular_qm_models import Atom, Molecule, MoleculeList
 from molecular_qm_psi4.models.crest_input import CrestInput, CrestLevelOfTheoryEnum
 from molecular_qm_search.optimization.compare_optimization_methods import (
+    HARTREE_TO_KCAL_MOL,
     CompareConformers,
     ConformerRelaxationMethod,
     XTBListCalculatorParameters,
@@ -450,6 +451,7 @@ async def test_off_uses_existing_energies_without_calculators(monkeypatch, all_i
             mol.atoms[0].x = float(index + 1)
             if energy is not None:
                 mol.properties["energy"] = energy
+                mol.properties["energy_unit"] = "kcal/mol"
             result.append(mol)
         return result
 
@@ -500,10 +502,11 @@ async def test_off_uses_existing_energies_without_calculators(monkeypatch, all_i
         assert [mol.properties["energy"] for mol in result] == [-3.0, -2.0, -1.0]
         assert [mol.properties["rank_id"] for mol in result] == [1, 2, 3]
         assert [mol.properties["method"] for mol in result] == ["Babel", "RDKit", "Babel"]
-        assert runner.comparison_table is runner.table
-        assert len(runner.table.row) == 3
-        assert runner.table.row[0]["RDKit"] == "1/0.0"
-        assert runner.table.row[1]["Babel"] == "1/0.0"
+        assert "table" not in vars(runner)
+        assert len(runner.comparison_table.row) == 3
+        assert runner.comparison_table.row[0]["RDKit"] == "1/0.0"
+        assert runner.comparison_table.row[1]["Babel"] == "1/0.0"
+        assert runner.comparison_table.row[1]["Relative energy (kcal/mol)"] == pytest.approx(1.0)
 
 
 @pytest.mark.asyncio
@@ -512,7 +515,7 @@ async def test_complete_ranking_and_distinct_low_energy_coverage(monkeypatch):
         result = MoleculeList()
         for shape, energy in values:
             mol = _carbon()
-            mol.properties.update(energy=energy, shape=shape)
+            mol.properties.update(energy=energy, energy_unit="kcal/mol", shape=shape)
             result.append(mol)
         return result
 
@@ -550,14 +553,14 @@ async def test_complete_ranking_and_distinct_low_energy_coverage(monkeypatch):
     assert returned.status == TaskStatus.COMPLETED
     assert isinstance(returned.comparison_table, SimpleTable)
     assert isinstance(returned.method_success_table, SimpleTable)
-    assert returned.comparison_table is returned.table
+    assert "table" not in (returned.model_extra or {})
     result = returned.molecule_list
-    assert len(result) == len(runner.table.row) == 105
+    assert len(result) == len(runner.comparison_table.row) == 105
     assert [mol.properties["energy"] for mol in result] == sorted(m.properties["energy"] for m in [*babel, *rdkit])
-    assert runner.table.row[2]["Method"] == "RDKit"
-    assert runner.table.row[2]["Method rank"] == 1
-    assert runner.table.row[2]["Relative energy"] == pytest.approx(0.2)
-    assert runner.table.row[3]["RDKit"] == "NA/NA"
+    assert runner.comparison_table.row[2]["Method"] == "RDKit"
+    assert runner.comparison_table.row[2]["Method rank"] == 1
+    assert runner.comparison_table.row[2]["Relative energy (kcal/mol)"] == pytest.approx(0.2)
+    assert runner.comparison_table.row[3]["RDKit"] == "NA/NA"
     by_method = {row["Method"]: row for row in runner.method_success_table.row}
     assert by_method["Babel"]["Coverage (%)"] == 100.0
     assert by_method["RDKit"]["Coverage (%)"] == 50.0
@@ -565,3 +568,107 @@ async def test_complete_ranking_and_distinct_low_energy_coverage(monkeypatch):
     assert by_method["CREST"]["Ranked"] == 0
     assert by_method["CREST"]["Coverage (%)"] == 0.0
     assert all(row["Low-energy reference count"] == 2 for row in by_method.values())
+
+
+@pytest.mark.asyncio
+async def test_relative_energy_converts_hartree_to_kcal_per_mol(monkeypatch):
+    def babel(mol, cg_input, **kwargs):
+        generated = MoleculeList()
+        for _energy in (-1.0, -0.99):
+            generated.append(Molecule.from_molecule(mol))
+        return generated
+
+    async def fake_dftb(molecules, opts, **kwargs):
+        results = {}
+        for index, energy in enumerate((-1.0, -0.99)):
+            relaxed = Molecule.from_molecule(molecules[index])
+            results[str(index)] = {
+                "success": True,
+                "result_qm_result": SimpleNamespace(
+                    final_structure=relaxed, final_energy=energy
+                ),
+            }
+        return SimpleNamespace(dataset={"results": results})
+
+    monkeypatch.setattr(
+        "molecular_qm_util.obabel_scripts.openbabel_conformers.conformers_openbabel",
+        babel,
+    )
+    monkeypatch.setattr(
+        "molecular_qm_models.align_molecules.align_molecules",
+        lambda left, right: (None, None, 0.0),
+    )
+    import molecular_qm_dftb.nodes.dftb_list_calculator  # noqa: F401
+    monkeypatch.setattr(
+        sys.modules["molecular_qm_dftb.nodes.dftb_list_calculator"],
+        "dftb_list_calculator",
+        fake_dftb,
+    )
+    runner = _runner()
+    await compare_optimization_methods.__wrapped__(
+        CompareConformers(
+            use_ga=False, use_babel=True, molecule=_carbon(), dftb_parameters=_dftb(),
+        ),
+        node_runner=runner,
+    )
+    rows = runner.comparison_table.row
+    assert rows[0]["Energy"] == -1.0
+    assert rows[0]["Relative energy (kcal/mol)"] == 0.0
+    assert rows[1]["Relative energy (kcal/mol)"] == pytest.approx(0.01 * HARTREE_TO_KCAL_MOL)
+    assert "table" not in vars(runner)
+
+    hartree = MoleculeList()
+    for energy in (-2.0, -1.5):
+        mol = _carbon()
+        mol.properties.update(energy=energy, energy_unit="Eh")
+        hartree.append(mol)
+    monkeypatch.setattr(
+        "molecular_qm_util.obabel_scripts.openbabel_conformers.conformers_openbabel",
+        lambda *args, **kwargs: hartree,
+    )
+    off_runner = _runner()
+    await compare_optimization_methods.__wrapped__(
+        CompareConformers(
+            use_ga=False, molecule=_carbon(), relaxation_method="off",
+        ),
+        node_runner=off_runner,
+    )
+    assert off_runner.comparison_table.row[1]["Relative energy (kcal/mol)"] == pytest.approx(
+        0.5 * HARTREE_TO_KCAL_MOL
+    )
+
+
+@pytest.mark.asyncio
+async def test_off_rejects_missing_or_mixed_energy_units(monkeypatch):
+    missing = MoleculeList()
+    mol = _carbon()
+    mol.properties["energy"] = -1.0
+    missing.append(mol)
+    monkeypatch.setattr(
+        "molecular_qm_util.obabel_scripts.openbabel_conformers.conformers_openbabel",
+        lambda *args, **kwargs: missing,
+    )
+    with pytest.raises(ValueError, match="energy_unit"):
+        await compare_optimization_methods.__wrapped__(
+            CompareConformers(
+                use_ga=False, molecule=_carbon(), relaxation_method="off",
+            ),
+            node_runner=_runner(),
+        )
+
+    mixed = MoleculeList()
+    for energy, unit in ((-1.0, "kcal/mol"), (-2.0, "hartree")):
+        mol = _carbon()
+        mol.properties.update(energy=energy, energy_unit=unit)
+        mixed.append(mol)
+    monkeypatch.setattr(
+        "molecular_qm_util.obabel_scripts.openbabel_conformers.conformers_openbabel",
+        lambda *args, **kwargs: mixed,
+    )
+    with pytest.raises(ValueError, match="one unit"):
+        await compare_optimization_methods.__wrapped__(
+            CompareConformers(
+                use_ga=False, molecule=_carbon(), relaxation_method="off",
+            ),
+            node_runner=_runner(),
+        )

@@ -20,6 +20,9 @@ from simstack.util.generate_ui_schema import generate_ui_schema
 
 logger = logging.getLogger(__name__)
 
+# CODATA hartree to kcal/mol, same factor as DFTBEvaluator.
+HARTREE_TO_KCAL_MOL = 627.5094740631
+
 
 class ConformerRelaxationMethod(str, Enum):
     """List calculator used to relax the generated conformers."""
@@ -505,8 +508,11 @@ async def compare_optimization_methods(
 
     ``relaxation_method`` selects the final relaxation. xTB exposes
     ``xtb_parameters`` for ``xtb_optimize_molecule_list``. DFTB exposes
-    ``dftb_parameters`` for ``dftb_list_calculator``. Off skips both calculators
-    and ranks using existing energies as supplied, without unit conversion.
+    ``dftb_parameters`` for ``dftb_list_calculator``. Both calculators return
+    energies in hartree. Off skips both calculators and ranks using existing
+    energies. Those energies must set ``properties['energy_unit']`` to
+    ``kcal/mol`` or ``hartree``. The comparison table reports relative energy
+    in kcal/mol. It is attached once, as ``comparison_table``.
 
     Called Nodes:
         run_ga_conformer_gen
@@ -654,6 +660,32 @@ async def compare_optimization_methods(
     all_conformers.sort(key=lambda x: x["energy"])
     top_conformers = all_conformers
 
+    resolved_units = set()
+    for item in all_conformers:
+        if opts.relaxation_method == ConformerRelaxationMethod.OFF:
+            raw_unit = item["molecule"].properties.get("energy_unit")
+            if raw_unit is None:
+                raise ValueError(
+                    "existing energies must set properties['energy_unit'] to "
+                    "'kcal/mol' or 'hartree' when final relaxation is off"
+                )
+            unit = str(raw_unit).strip().lower()
+        else:
+            unit = "hartree"
+        if unit == "kcal/mol":
+            resolved_units.add("kcal/mol")
+        elif unit in {"hartree", "eh", "ha"}:
+            resolved_units.add("hartree")
+        else:
+            raise ValueError(
+                f"unsupported energy unit {unit!r}; expected kcal/mol or hartree"
+            )
+    if len(resolved_units) != 1:
+        raise ValueError(
+            "pooled conformer energies must use one unit, kcal/mol or hartree"
+        )
+    relative_scale = HARTREE_TO_KCAL_MOL if resolved_units == {"hartree"} else 1.0
+
     # 4. Prepare SimpleTable comparing each conformer with conformers from each method
     comparison_table = SimpleTable(name="Conformer Comparison Table")
     comparison_table.add_column("Total rank", SimpleTableColumnType.NUMBER)
@@ -661,7 +693,7 @@ async def compare_optimization_methods(
         ("Method", SimpleTableColumnType.STRING),
         ("Method rank", SimpleTableColumnType.NUMBER),
         ("Energy", SimpleTableColumnType.NUMBER),
-        ("Relative energy", SimpleTableColumnType.NUMBER),
+        ("Relative energy (kcal/mol)", SimpleTableColumnType.NUMBER),
     ):
         comparison_table.add_column(column, kind)
     for m in active_methods:
@@ -695,7 +727,9 @@ async def compare_optimization_methods(
             "Method": target_method,
             "Method rank": target_rank,
             "Energy": item["energy"],
-            "Relative energy": item["energy"] - all_conformers[0]["energy"],
+            "Relative energy (kcal/mol)": (
+                item["energy"] - all_conformers[0]["energy"]
+            ) * relative_scale,
         }
         is_reference = (
             len(references) < opts.comparison_count
@@ -766,7 +800,6 @@ async def compare_optimization_methods(
         })
 
     if node_runner is not None:
-        node_runner.table = comparison_table
         node_runner.comparison_table = comparison_table
         node_runner.method_success_table = success_table
         node_runner.molecule_list = best_conformers
@@ -774,7 +807,9 @@ async def compare_optimization_methods(
             f"Ranked all {len(best_conformers)} usable configurations. Method columns show "
             "closest matching method rank/RMSD (Angstrom), or NA/NA. Success is coverage "
             f"of the {len(references)} lowest-energy RMSD-distinct pooled conformers; "
-            "methods with equal coverage are tied. Energy and relative energy use the calculator's units."
+            "methods with equal coverage are tied. Relative energy is in kcal/mol. "
+            "Absolute energy stays in hartree for xTB and DFTB, and in the supplied "
+            "energy unit when final relaxation is off."
         )
         if opts.relaxation_method == ConformerRelaxationMethod.OFF:
             node_runner.warning(
