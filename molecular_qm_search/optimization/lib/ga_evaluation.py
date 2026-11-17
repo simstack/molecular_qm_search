@@ -134,6 +134,7 @@ class RDKitEvaluator(BaseModel):
 
         from rdkit import Chem
         from rdkit.Chem import AllChem
+        from rdkit.Chem import rdtrajectory
         from rdkit.Geometry import Point3D
 
         template = self._template()
@@ -185,7 +186,10 @@ class RDKitEvaluator(BaseModel):
             gradient_test = None
             accepted_energy = None
             progress_rows = []
+            energy_traces = []
             if optimize:
+                if rdtrajectory.Snapshot is None:
+                    raise ValueError("RDKit trajectory snapshots are unavailable")
                 performed = 0
                 minimize_force_tol = force_tol
                 rdkit_converged = False
@@ -200,9 +204,25 @@ class RDKitEvaluator(BaseModel):
                             )
                         force_field.Initialize()
                         rdkit_converged = False
-                    status = force_field.Minimize(
-                        maxIts=int(max_iters), forceTol=minimize_force_tol, energyTol=1e-6,
+                    status, snapshots = force_field.MinimizeTrajectory(
+                        1, int(max_iters), minimize_force_tol, 1e-6,
                     )
+                    if not isinstance(snapshots, (list, tuple)) or len(snapshots) < 1:
+                        raise ValueError("Force-field optimization recorded no energy iterations")
+                    trace = []
+                    for iteration, snapshot in enumerate(snapshots, start=1):
+                        get_energy = getattr(snapshot, "GetEnergy", None)
+                        if not callable(get_energy):
+                            raise ValueError(
+                                f"Force-field optimization iteration {iteration} has no energy"
+                            )
+                        step_energy = float(get_energy())
+                        if not math.isfinite(step_energy):
+                            raise ValueError(
+                                f"Force-field optimization iteration {iteration} energy is not finite"
+                            )
+                        trace.append(step_energy)
+                    energy_traces.append(trace)
                     performed += 1
                     raw_gradient = tuple(force_field.CalcGrad())
                     if any(not math.isfinite(component) for component in raw_gradient):
@@ -263,6 +283,7 @@ class RDKitEvaluator(BaseModel):
             result.properties.pop("force_field_gradient", None)
             result.properties.pop("force_field_attempts", None)
             result.properties.pop("force_field_progress", None)
+            result.properties.pop("force_field_energy_traces", None)
             if optimize:
                 for index, atom in enumerate(result.atoms):
                     position = conformer.GetAtomPosition(index)
@@ -273,6 +294,12 @@ class RDKitEvaluator(BaseModel):
                         raise ValueError("Force-field optimization stopped without a gradient")
                     result.properties["force_field_discarded"] = True
                     result.properties["force_field_gradient"] = float(gradient_test)
+                    if len(energy_traces) != performed:
+                        raise ValueError(
+                            f"Discarded optimization has {len(energy_traces)} energy traces "
+                            f"for {performed} attempts"
+                        )
+                    result.properties["force_field_energy_traces"] = energy_traces
                 if require_improvement:
                     result.properties["force_field_attempts"] = performed
                     if not progress_rows:

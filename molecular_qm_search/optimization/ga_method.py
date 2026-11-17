@@ -157,6 +157,7 @@ class BaseGA:
         self.population_generator = None
         self.evaluated_molecules: List[Molecule] = []
         self._dihedral_histogram_names: List[str] = []
+        self._optimization_chart_names: List[str] = []
 
     def molecule_from_coordinates(self, coords: InternalCoordinatesList) -> Molecule:
         return self.population_generator.molecule_from_coordinates(coords)
@@ -593,6 +594,46 @@ class BaseGA:
             "Discarded conformer because the force-field gradient stayed high "
             f"({float(gradient):.6g}) {repeat}."
         )
+        traces = molecule.properties.get("force_field_energy_traces")
+        if traces is not None:
+            if not isinstance(traces, list) or not traces:
+                raise ValueError("Discarded conformer has no optimization energy trace")
+            for trace in traces:
+                index = len(self._optimization_chart_names) + 1
+                if not isinstance(trace, list) or not trace:
+                    raise ValueError(f"Optimization {index} has no energy iterations")
+                data = []
+                for iteration, energy in enumerate(trace, start=1):
+                    value = float(energy)
+                    if not np.isfinite(value):
+                        raise ValueError(
+                            f"Optimization {index} iteration {iteration} energy is not finite"
+                        )
+                    data.append({"iteration": iteration, "energy": value})
+                name = f"optimization_energy_{index}"
+                series = [
+                    AGLineSeriesConfig(
+                        type="line",
+                        xKey="iteration",
+                        yKey="energy",
+                        title="energy",
+                        data=data,
+                        stroke="#4ECDC4",
+                    )
+                ]
+                chart = ChartArtifactModel(
+                    data=data,
+                    title=AGChartTitleConfig(text=f"Optimization {index} energy vs iteration"),
+                    series=series,
+                    axes=[
+                        AGChartAxisConfig(type="number", position="bottom", title="iteration"),
+                        AGChartAxisConfig(type="number", position="left", title="energy"),
+                    ],
+                    legend=AGChartLegendConfig(enabled=False),
+                )
+                setattr(self.node_runner, name, chart)
+                self._optimization_chart_names.append(name)
+            self._persist_live_artifacts()
         return True
 
     def _count_origin(self, origin: str, *, elite: bool) -> None:
@@ -1221,6 +1262,7 @@ class BaseGA:
         for name in (
             "energy_chart", "energy_histogram", "accepted_histogram", "diversity_chart",
             *self._dihedral_histogram_names,
+            *self._optimization_chart_names,
         ):
             chart = getattr(self.node_runner, name, None)
             if chart is None:
@@ -1374,7 +1416,8 @@ class BaseGA:
             "min energy + 0.1*|min energy| before breeding. "
             "When a force-field minimization stops with a gradient above its force "
             "tolerance, a population conformer is repeated twice and discarded if the "
-            "gradient is still high. The initial geometry is minimized 10 times. "
+            "gradient is still high. Each of those optimizations is saved as an "
+            "energy-versus-iteration chart. The initial geometry is minimized 10 times. "
             "Each attempt logs its energy and gradient norm, and the search stops "
             "afterward if the force tolerance is still missed."
         )

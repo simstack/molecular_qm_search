@@ -838,6 +838,16 @@ def test_high_force_field_gradient_is_repeated_twice_then_discarded(molecule, mo
             assert forceTol == 1e-4
             return 0
 
+        def MinimizeTrajectory(self, snapshotFreq, maxIts, forceTol, energyTol):
+            status = self.Minimize(maxIts, forceTol, energyTol)
+            energy = self.CalcEnergy()
+
+            class Snapshot:
+                def GetEnergy(self):
+                    return energy
+
+            return status, [Snapshot(), Snapshot()]
+
         def CalcEnergy(self):
             return 50.0
 
@@ -853,6 +863,7 @@ def test_high_force_field_gradient_is_repeated_twice_then_discarded(molecule, mo
     assert result[0].properties["force_field_discarded"] is True
     assert result[0].properties["optimization_converged"] is False
     assert result[0].properties["force_field_gradient"] > 1e-4
+    assert result[0].properties["force_field_energy_traces"] == [[50.0, 50.0]] * 3
 
 
 def _scripted_force_field(molecule, energies, gradients, calls, tols=None, status=None):
@@ -872,6 +883,16 @@ def _scripted_force_field(molecule, energies, gradients, calls, tols=None, statu
             if self.step > len(energies):
                 raise AssertionError("minimization continued after the scripted steps")
             return status
+
+        def MinimizeTrajectory(self, snapshotFreq, maxIts, forceTol, energyTol):
+            status_code = self.Minimize(maxIts, forceTol, energyTol)
+            energy = self.CalcEnergy()
+
+            class Snapshot:
+                def GetEnergy(self):
+                    return energy
+
+            return status_code, [Snapshot()]
 
         def CalcEnergy(self):
             return energies[self.step - 1]
@@ -1046,6 +1067,16 @@ def test_low_force_field_gradient_stops_without_a_repeat(molecule, monkeypatch):
             calls["minimize"] += 1
             return 0
 
+        def MinimizeTrajectory(self, snapshotFreq, maxIts, forceTol, energyTol):
+            status = self.Minimize(maxIts, forceTol, energyTol)
+            energy = self.CalcEnergy()
+
+            class Snapshot:
+                def GetEnergy(self):
+                    return energy
+
+            return status, [Snapshot()]
+
         def CalcEnergy(self):
             return 50.0
 
@@ -1059,6 +1090,7 @@ def test_low_force_field_gradient_stops_without_a_repeat(molecule, monkeypatch):
     result = evaluator.optimize([molecule], max_iters=20)
     assert calls["minimize"] == 1
     assert result[0].properties.get("force_field_discarded") is not True
+    assert "force_field_energy_traces" not in result[0].properties
     assert result[0].properties["optimization_converged"] is True
 
 
@@ -1239,6 +1271,64 @@ def test_minimizing_ga_drops_a_conformer_whose_gradient_stays_high(molecule, coo
     assert scored[1][0] == 2.0
     assert "gradient stayed high (12.5)" in runner.log_string
     assert "two repeated optimizations" in runner.log_string
+
+
+def test_generation_zero_discard_saves_two_optimization_energy_charts(
+    molecule, coordinates, tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+
+    class DiscardSecondOptimization:
+        def __init__(self):
+            self.calls = 0
+
+        def score(self, molecules):
+            results = []
+            for source in molecules:
+                result = Molecule.from_molecule(source)
+                result.properties["energy"] = 1.0
+                result.properties["energy_unit"] = "kcal/mol"
+                results.append(result)
+            return results
+
+        def optimize(self, molecules, *, max_iters):
+            self.calls += 1
+            results = []
+            for source in molecules:
+                result = Molecule.from_molecule(source)
+                result.properties["energy"] = 1.0
+                result.properties["energy_unit"] = "kcal/mol"
+                if self.calls > 1:
+                    result.properties["force_field_discarded"] = True
+                    result.properties["force_field_gradient"] = 0.000179152
+                    result.properties["force_field_energy_traces"] = [
+                        [20.0, 15.0, 12.0],
+                        [12.0, 11.5, 11.4],
+                    ]
+                results.append(result)
+            return results
+
+    runner = RecordingRunner()
+    ga = MinimizingGA(
+        molecule, runner, evaluator=DiscardSecondOptimization(), coordinates=coordinates,
+        pop_size=1, generations=0,
+    )
+    with pytest.raises(ValueError, match="Generation 0 has no conformers"):
+        ga.run()
+    assert ga._optimization_chart_names == [
+        "optimization_energy_1", "optimization_energy_2",
+    ]
+    first = runner.optimization_energy_1
+    second = runner.optimization_energy_2
+    assert first.title.text == "Optimization 1 energy vs iteration"
+    assert second.title.text == "Optimization 2 energy vs iteration"
+    assert [row["iteration"] for row in first.data] == [1, 2, 3]
+    assert [row["energy"] for row in first.data] == [20.0, 15.0, 12.0]
+    assert [row["energy"] for row in second.data] == [12.0, 11.5, 11.4]
+    assert first.series[0].yKey == "energy"
+    assert first.axes[0].title == "iteration"
+    assert first.axes[1].title == "energy"
+    assert "gradient stayed high (0.000179152)" in runner.log_string
 
 
 @pytest.mark.parametrize("ga_class", [StandardGA, MinimizingGA, DiversityGA])
